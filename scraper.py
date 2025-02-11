@@ -31,10 +31,21 @@ def random_delay(min_seconds=2, max_seconds=5):
     
     time.sleep(delay)
 
-def get_search_link(title: str, doi: str = None) -> str:
-    """Get the search URL for a paper."""
+def get_search_link(title: str, doi: str = None, source: str = 'wiley') -> str:
+    """
+    Get the search URL for a paper.
+    Args:
+        title: Paper title
+        doi: DOI if available
+        source: Source platform ('wiley' or 'jstor')
+    Returns:
+        Direct URL to the paper if possible, None otherwise
+    """
     if doi:
-        return f"https://onlinelibrary.wiley.com/doi/{doi}"
+        if source.lower() == 'wiley':
+            return f"https://onlinelibrary.wiley.com/doi/{doi}"
+        elif source.lower() == 'jstor':
+            return f"https://www.jstor.org/stable/{doi}"
     return None
 
 def create_driver():
@@ -242,9 +253,9 @@ def get_random_financial_searches(num_searches: int = 2) -> List[str]:
     ]
     return random.sample(search_terms, min(num_searches, len(search_terms)))
 
-def save_wiley_page_content(driver, title: str) -> str:
+def save_page_content(driver, title: str) -> str:
     """
-    Save the HTML content of a Wiley page using Selenium's page source.
+    Save the HTML content of a page using Selenium's page source.
     Args:
         driver: Selenium WebDriver instance
         title: Paper title (used for filename)
@@ -266,11 +277,11 @@ def save_wiley_page_content(driver, title: str) -> str:
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(html_content)
             
-        print(f"Saved Wiley page content to: {filename}")
+        print(f"Saved page content to: {filename}")
         return filename
         
     except Exception as e:
-        print(f"Error saving Wiley page: {str(e)}")
+        print(f"Error saving page: {str(e)}")
         return None
 
 def is_cloudflare_captcha(driver) -> bool:
@@ -319,9 +330,32 @@ def is_valid_wiley_page(driver) -> bool:
     except:
         return False
 
+def is_valid_jstor_page(driver) -> bool:
+    """
+    Check if we're on a valid JSTOR paper page
+    Args:
+        driver: Selenium WebDriver instance
+    Returns:
+        True if on valid paper page, False otherwise
+    """
+    try:
+        # Look for common elements that should be on a valid JSTOR paper page
+        required_elements = [
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "title-container"))
+            ),
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "content-area"))
+            )
+        ]
+        return all(element.is_displayed() for element in required_elements)
+    except:
+        return False
+
 def get_doi_from_google_scholar(driver, title: str, journal: str = None) -> Tuple[str, str]:
     """
     Use Google Scholar to find DOI for a paper by clicking the first result.
+    First attempts to find on Wiley, then falls back to JSTOR if no good match is found.
     Args:
         driver: Selenium WebDriver instance
         title: Paper title to search for
@@ -329,6 +363,93 @@ def get_doi_from_google_scholar(driver, title: str, journal: str = None) -> Tupl
     Returns:
         Tuple of (DOI string if found or None, path to saved HTML file or None)
     """
+    def try_source(source_site: str) -> Tuple[str, str]:
+        try:
+            # Now do our actual search with site restriction
+            search_query = f'"{title}" site:{source_site}'
+            if journal:
+                search_query += f' source:"{journal}"'
+            
+            encoded_query = urllib.parse.quote(search_query)
+            url = f"https://scholar.google.com/scholar?q={encoded_query}"
+            print(f"\nSearching Google Scholar for: {search_query}")
+            
+            driver.get(url)
+            random_delay(2, 3)
+            add_random_scroll(driver)
+            
+            # Look for the first title link
+            try:
+                title_link = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "h3.gs_rt a"))
+                )
+            except TimeoutException:
+                print(f"No results found for {source_site}")
+                return None, None
+            
+            # Get the href before clicking
+            href = title_link.get_attribute('href')
+            print(f"Found link: {href}")
+            
+            # Extract DOI and clean it up
+            doi = None
+            html_file = None
+            
+            if source_site == 'wiley.com' and 'wiley.com' in href and 'doi' in href:
+                doi = href.split('doi/')[-1].split('?')[0].split('#')[0]
+                if 'abs/' in doi:  # Remove 'abs/' prefix if present
+                    doi = doi.replace('abs/', '')
+                if 'full/' in doi:  # Remove 'full/' prefix if present
+                    doi = doi.replace('full/', '')
+                print(f"Found DOI: {doi}")
+                
+                # Navigate to the full article page using get_search_link
+                full_article_url = get_search_link(title, doi, source='wiley')
+                print(f"\nNavigating to: {full_article_url}")
+                driver.get(full_article_url)
+                
+                # Check if we hit a Cloudflare challenge
+                if is_cloudflare_captcha(driver):
+                    print("Hit Cloudflare challenge, waiting...")
+                    time.sleep(10)  # Give time for manual solving if needed
+                
+                # Verify we're on a valid page
+                if not is_valid_wiley_page(driver):
+                    print("Not a valid Wiley page")
+                    return None, None
+                
+                # Save the page content
+                html_file = save_page_content(driver, title)
+                
+            elif source_site == 'jstor.org' and 'jstor.org' in href:
+                # Navigate to the JSTOR page
+                print(f"\nNavigating to: {href}")
+                driver.get(href)
+                
+                # Check if we're on a valid JSTOR page
+                if not is_valid_jstor_page(driver):
+                    print("Not a valid JSTOR page")
+                    return None, None
+                
+                # Save the page content
+                html_file = save_page_content(driver, title)
+                
+                # For JSTOR, we might need to extract DOI from the page metadata
+                try:
+                    doi_meta = WebDriverWait(driver, 5).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "meta[name='citation_doi']"))
+                    )
+                    doi = doi_meta.get_attribute('content')
+                    print(f"Found DOI from JSTOR metadata: {doi}")
+                except:
+                    print("Could not find DOI in JSTOR metadata")
+            
+            return doi, html_file
+            
+        except Exception as e:
+            print(f"Error processing {source_site}: {str(e)}")
+            return None, None
+
     try:
         # Add finance research cookies
         add_scholar_cookies(driver)
@@ -340,64 +461,18 @@ def get_doi_from_google_scholar(driver, title: str, journal: str = None) -> Tupl
             random_delay(2, 3)
             add_random_scroll(driver)
         
-        # Now do our actual search
-        search_query = f'"{title}"'
-        if journal:
-            search_query += f' source:"{journal}"'
+        # First try Wiley
+        doi, html_file = try_source('wiley.com')
         
-        encoded_query = urllib.parse.quote(search_query)
-        url = f"https://scholar.google.com/scholar?q={encoded_query}"
-        print(f"\nSearching Google Scholar for: {search_query}")
-        
-        driver.get(url)
-        random_delay(2, 3)
-        add_random_scroll(driver)
-        
-        # Look for the first title link
-        title_link = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "h3.gs_rt a"))
-        )
-        
-        # Get the href before clicking
-        href = title_link.get_attribute('href')
-        print(f"Found link: {href}")
-        
-        # Extract DOI and clean it up
-        doi = None
-        html_file = None
-        if 'wiley.com' in href and 'doi' in href:
-            doi = href.split('doi/')[-1].split('?')[0].split('#')[0]
-            if 'abs/' in doi:  # Remove 'abs/' prefix if present
-                doi = doi.replace('abs/', '')
-            if 'full/' in doi:  # Remove 'full/' prefix if present
-                doi = doi.replace('full/', '')
-            print(f"Found DOI: {doi}")
-            
-            # Navigate to the full article page
-            full_article_url = f"https://onlinelibrary.wiley.com/doi/full/{doi}"
-            print(f"\nNavigating to: {full_article_url}")
-            driver.get(full_article_url)
-            
-            # Wait for page to load
-            random_delay(3, 4)
-            
-            # Check for Cloudflare captcha
-            if is_cloudflare_captcha(driver):
-                print("Encountered Cloudflare captcha, skipping...")
-                return None, None
-                
-            # Verify we're on a valid Wiley page
-            if not is_valid_wiley_page(driver):
-                print("Not on a valid Wiley paper page, skipping...")
-                return None, None
-            
-            # Save the page content
-            html_file = save_wiley_page_content(driver, title)
+        # If Wiley fails, try JSTOR
+        if not doi or not html_file:
+            print("\nNo valid result from Wiley, trying JSTOR...")
+            doi, html_file = try_source('jstor.org')
         
         return doi, html_file
             
     except Exception as e:
-        print(f"Error searching Google Scholar: {str(e)}")
+        print(f"Error in get_doi_from_google_scholar: {str(e)}")
         return None, None
 
 def process_papers_from_csv(csv_path: str = "data/JF.csv", journal: str = "the journal of finance"):
