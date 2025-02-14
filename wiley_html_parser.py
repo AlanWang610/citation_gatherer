@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from enum import Enum
 import re
+from datetime import datetime
 
 class ReferenceType(Enum):
     ARTICLE = "article"
@@ -26,6 +27,19 @@ class Reference:
     working_paper_institution: Optional[str] = None
     book_title: Optional[str] = None
     chapter_title: Optional[str] = None
+
+@dataclass
+class ArticleMetadata:
+    title: Optional[str]
+    authors: List[str]
+    published_date: Optional[str]
+    volume: Optional[str]
+    issue: Optional[str]
+    page_first: Optional[str]
+    page_last: Optional[str]
+    citations: Optional[int]
+    doi: Optional[str]
+    references: List[Reference]
 
 def clean_text(text: str) -> str:
     """Clean text by removing extra whitespace and special characters"""
@@ -140,7 +154,7 @@ def clean_volume(text: str) -> str:
     # Extract just the first set of numbers
     match = re.search(r'\d+', text)
     if match:
-        return match.group(0)
+        return match.group(1)
     return ""
 
 def split_name(name: str) -> str:
@@ -150,6 +164,19 @@ def split_name(name: str) -> str:
     # Remove any single letters (likely initials without dots)
     name = re.sub(r'\s+[A-Z]\s+', ' ', name)
     return clean_text(name)
+
+def parse_date(date_str: str) -> Optional[str]:
+    """Convert date from '07 November 2003' format to datetime string"""
+    if not date_str:
+        return None
+    try:
+        from datetime import datetime
+        # Parse the date string
+        date_obj = datetime.strptime(date_str.strip(), "%d %B %Y")
+        # Convert to ISO format
+        return date_obj.strftime("%Y-%m-%d")
+    except Exception:
+        return None
 
 def parse_reference(ref_elem) -> Reference:
     """
@@ -183,129 +210,156 @@ def parse_reference(ref_elem) -> Reference:
         if year_elem:
             ref.year = extract_year(year_elem.get_text())
         
-        # Determine reference type and extract appropriate title fields
+        # Determine reference type
+        full_text = ref_elem.get_text()
+        
+        # 1. Check for working paper
+        if re.search(r'working\s+paper', full_text, re.IGNORECASE):
+            ref.ref_type = ReferenceType.WORKING_PAPER
+            
+            # Extract title for working paper - it's between the year and "Working paper"
+            year_elem = ref_elem.find(class_='pubYear')
+            if year_elem:
+                # Get text after the year up to "Working paper"
+                after_year = full_text[full_text.find(year_elem.get_text()) + len(year_elem.get_text()):]
+                title_match = re.search(r',\s*([^,]+?)(?:\s+Working\s+paper)', after_year, re.IGNORECASE)
+                if title_match:
+                    ref.title = clean_text(title_match.group(1))
+            
+            # Extract working paper institution
+            # Look for text after "Working paper" or "Working Paper"
+            match = re.search(r'working\s+paper\s*,\s*([^.]+?)(?:\.|$)', full_text, re.IGNORECASE)
+            if match:
+                ref.working_paper_institution = match.group(1).strip()
+        
+        # 2. Check for journal (has italicized title)
+        elif ref_elem.find('i'):
+            ref.ref_type = ReferenceType.ARTICLE
+            # Extract title from articleTitle class for journal articles
+            article_elem = ref_elem.find(class_='articleTitle')
+            if article_elem:
+                ref.title = clean_text(article_elem.get_text())
+            
+            # Extract journal name from italicized text
+            italic_elems = ref_elem.find_all(['i', 'em'])
+            if italic_elems:
+                # Get the text from all italic elements
+                journal_text = ' '.join(clean_text(elem.get_text()) for elem in italic_elems if elem.get_text().strip())
+                if journal_text:
+                    ref.journal = journal_text
+        
+        # 3. Otherwise it's a book
+        else:
+            ref.ref_type = ReferenceType.BOOK
+            # Extract title from bookTitle class for books
+            book_elem = ref_elem.find(class_='bookTitle')
+            if book_elem:
+                ref.title = clean_text(book_elem.get_text())
+
+        # Extract title
         chapter_elem = ref_elem.find(class_='chapterTitle')
         book_elem = ref_elem.find(class_='bookTitle')
-        article_elem = ref_elem.find(class_='articleTitle')
         other_elem = ref_elem.find(class_='otherTitle')
         
         # Check for book first
         if chapter_elem or book_elem:
-            ref.ref_type = ReferenceType.BOOK
             if chapter_elem:
                 ref.chapter_title = clean_text(chapter_elem.get_text())
             if book_elem:
                 ref.book_title = clean_text(book_elem.get_text())
         
-        # Check for article title
-        elif article_elem:
-            ref.ref_type = ReferenceType.ARTICLE
-            ref.title = clean_text(article_elem.get_text())
-        
-        # Check other title if no article title
+        # Check for other title
         elif other_elem:
             ref.title = clean_text(other_elem.get_text())
-            # Type will be determined later based on working paper check
-            
-        # If title contains journal info (happens in some cases), split it out
-        if ref.title and ' Journal of ' in ref.title:
-            parts = ref.title.split(' Journal of ')
-            ref.title = clean_text(parts[0])
-            if not ref.journal:  # Only set journal if not already set
-                ref.journal = 'Journal of ' + clean_text(parts[1])
-        
-        # Extract journal from <i> tags or look for working paper
-        journal_elem = ref_elem.find('i')
-        if journal_elem:
-            text = journal_elem.get_text().strip()
-            # Check if it's a working paper
-            working_paper_match = re.search(r'[Ww]orking\s+[Pp]aper,?\s*(.*?)(?:\s*\d{4}|\s*$|[,.])', text)
-            if working_paper_match:
+            # Check if this might be a working paper
+            text_lower = ref.title.lower()
+            if 'working paper' in text_lower or 'discussion paper' in text_lower:
                 ref.ref_type = ReferenceType.WORKING_PAPER
-                institution = working_paper_match.group(1).strip('., ')
-                if institution:
-                    ref.working_paper_institution = institution
-            else:
-                ref.journal = clean_journal(text)
-        else:
-            # Also check full text for working paper mentions if no <i> tag found
+                # Try to extract institution
+                inst_match = re.search(r'([^,]+(?:University|Institute|College|School)[^,]*)', ref.title)
+                if inst_match:
+                    ref.working_paper_institution = inst_match.group(1).strip()
+        
+        # Extract volume and pages if it's a journal article
+        if ref.ref_type == ReferenceType.ARTICLE:
+            # Get the full text of the reference
             full_text = ref_elem.get_text()
-            working_paper_match = re.search(r'[Ww]orking\s+[Pp]aper,?\s*(.*?)(?:\s*\d{4}|\s*$|[,.])', full_text)
-            if working_paper_match:
-                ref.ref_type = ReferenceType.WORKING_PAPER
-                institution = working_paper_match.group(1).strip('., ')
-                if institution:
-                    ref.working_paper_institution = institution
-        
-        # Extract volume from class='vol'
-        vol_elem = ref_elem.find(class_='vol')
-        if vol_elem:
-            ref.volume = clean_volume(vol_elem.get_text())
             
-        # Extract pages from class='pageFirst' and 'pageLast'
-        page_first_elem = ref_elem.find(class_='pageFirst')
-        if page_first_elem:
-            ref.page_first = clean_pages(page_first_elem.get_text())
-            
-        page_last_elem = ref_elem.find(class_='pageLast')
-        if page_last_elem:
-            ref.page_last = clean_pages(page_last_elem.get_text())
+            # Find the journal in the full text and look at what comes after
+            journal_idx = full_text.find(ref.journal)
+            if journal_idx != -1:
+                after_journal = full_text[journal_idx + len(ref.journal):].strip()
+                
+                # Try different patterns for volume and pages
+                # Pattern 1: "Vol. X" or "Volume X" followed by pages
+                vol_match = re.search(r'(?:Vol\.|Volume)\s*(\d+)', after_journal)
+                if vol_match:
+                    ref.volume = vol_match.group(1)
+                    # Look for pages after the volume
+                    page_text = after_journal[vol_match.end():]
+                else:
+                    # Pattern 2: Just a number followed by comma and pages
+                    vol_match = re.search(r'(\d+)\s*[,.]', after_journal)
+                    if vol_match:
+                        ref.volume = vol_match.group(1)
+                        page_text = after_journal[vol_match.end():]
+                    else:
+                        page_text = after_journal
+                
+                # Look for page numbers in various formats
+                # Format 1: pp. 123-145 or p. 123-145
+                page_match = re.search(r'(?:pp?\.\s*)?(\d+)\s*[-–]\s*(\d+)', page_text)
+                if page_match:
+                    ref.page_first = page_match.group(1)
+                    ref.page_last = page_match.group(2)
+                else:
+                    # Format 2: Just numbers separated by hyphen
+                    page_match = re.search(r'(\d+)\s*[-–]\s*(\d+)', page_text)
+                    if page_match:
+                        ref.page_first = page_match.group(1)
+                        ref.page_last = page_match.group(2)
+                
+                if ref.volume or ref.page_first:
+                    pass
         
-        # Extract DOI using multiple methods
-        # 1. Try data-doi attribute first
-        data_doi_elem = ref_elem.find(attrs={'data-doi': True})
-        if data_doi_elem:
-            ref.doi = data_doi_elem['data-doi']
+        # Extract DOI if present
+        # First try to find DOI in hidden span with data-doi class
+        doi_container = ref_elem.find('div', class_='extra-links getFTR')
+        if doi_container:
+            doi_span = doi_container.find('span', class_='hidden data-doi')
+            if doi_span:
+                # Get the text directly from the span's first text node
+                for text in doi_span.stripped_strings:
+                    if text.startswith('10.'):
+                        ref.doi = text
+                        break
         
-        # 2. Try hidden DOI elements
+        # Fallback to looking for DOI in href if not found in span
         if not ref.doi:
-            hidden_doi = ref_elem.find(class_='hidden', text=re.compile(r'10\.\d{4,}/'))
-            if hidden_doi:
-                doi_match = re.search(r'(10\.\d{4,}/[-._;()/:\w]+)', hidden_doi.get_text())
-                if doi_match:
-                    ref.doi = doi_match.group(1)
+            doi_elem = ref_elem.find('a', href=re.compile(r'doi.org'))
+            if doi_elem:
+                doi_href = doi_elem['href']
+                if doi_href.startswith('https://doi.org/'):
+                    ref.doi = doi_href[len('https://doi.org/'):]
+                else:
+                    ref.doi = doi_href
         
-        # 3. Try accessionId links
-        if not ref.doi:
-            doi_elem = ref_elem.find('a', class_='accessionId')
-            if doi_elem and doi_elem.get('href'):
-                doi_url = doi_elem['href']
-                if 'doi.org' in doi_url:
-                    ref.doi = doi_url.split('doi.org/')[-1]
-        
-        # 4. Try extracting DOI from any text content as last resort
-        if not ref.doi:
-            text = ref_elem.get_text()
-            doi_match = re.search(r'(?:doi:?\s*|https?://doi\.org/)(10\.\d{4,}/[-._;()/:\w]+)', text)
-            if doi_match:
-                ref.doi = doi_match.group(1)
-        
-        # Clean up any extracted DOI
         if ref.doi:
-            # Remove any trailing punctuation or whitespace
-            ref.doi = ref.doi.strip('.,; ')
-            # Ensure it's a valid DOI pattern
-            if not re.match(r'^10\.\d{4,}/[-._;()/:\w]+$', ref.doi):
-                ref.doi = None
+            pass
         
-        # Handle forthcoming papers without page numbers
-        if ref.journal and 'forthcoming' in ref.journal.lower():
-            ref.journal = ref.journal.replace(', forthcoming', '').replace('forthcoming', '')
-            ref.page_first = 'forthcoming'
-            ref.page_last = 'forthcoming'
+        return ref
         
     except Exception as e:
         print(f"Error parsing reference: {str(e)}")
-    
-    return ref
+        return ref
 
-def parse_wiley_html(file_path: str) -> Tuple[str, List[str], str, List[Reference]]:
+def parse_wiley_html(file_path: str) -> ArticleMetadata:
     """
     Parse a Wiley HTML file to extract paper metadata
     Args:
         file_path: Path to the HTML file
     Returns:
-        Tuple of (title, authors, date, references)
+        ArticleMetadata object containing the paper's metadata and references
     """
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -340,9 +394,60 @@ def parse_wiley_html(file_path: str) -> Tuple[str, List[str], str, List[Referenc
                     authors.append(name)
                     seen_authors.add(name)
         
-        # Extract date
+        # Extract volume and issue from volume-issue class
+        volume = None
+        issue = None
+        volume_issue_elem = soup.find('a', class_='volume-issue')
+        if volume_issue_elem:
+            volume_text = volume_issue_elem.text
+            # Match "Volume X, Issue Y" format
+            match = re.match(r'Volume\s+(\d+),\s*Issue\s+(\d+)', volume_text)
+            if match:
+                volume = match.group(1)
+                issue = match.group(2)
+        
+        # Extract page numbers from citation__page-range class
+        page_first = None
+        page_last = None
+        pages_elem = soup.find('span', class_='citation__page-range')
+        if pages_elem:
+            pages_text = pages_elem.text
+            # Match "p. X-Y" format
+            match = re.search(r'p\.\s*(\d+)-(\d+)', pages_text)
+            if match:
+                page_first = match.group(1)
+                page_last = match.group(2)
+        
+        # Extract publication date
         date_elem = soup.find('span', class_='epub-date')
-        date = clean_text(date_elem.text) if date_elem else None
+        if date_elem:
+            try:
+                # Parse date text like "First published: 03 December 2003"
+                date_text = date_elem.get_text().strip()
+                if 'First published:' in date_text:
+                    date_text = date_text.split('First published:')[1].strip()
+                published_date = datetime.strptime(date_text, '%d %B %Y').date()
+            except (ValueError, AttributeError):
+                published_date = None
+        else:
+            published_date = None
+        
+        # Extract citation count from citedby-section link
+        citations = None
+        citations_elem = soup.find('a', href='#citedby-section')
+        if citations_elem:
+            citations_text = citations_elem.text
+            citations_match = re.search(r'(\d+)', citations_text)
+            if citations_match:
+                citations = int(citations_match.group(1))
+        
+        # Extract DOI from epub-doi class
+        doi = None
+        doi_elem = soup.find('a', class_='epub-doi')
+        if doi_elem:
+            doi_href = doi_elem.get('href')
+            if doi_href and doi_href.startswith('https://doi.org/'):
+                doi = doi_href[len('https://doi.org/'):]
         
         # Extract references
         references = []
@@ -358,33 +463,63 @@ def parse_wiley_html(file_path: str) -> Tuple[str, List[str], str, List[Referenc
                 if ref.authors:  # Only add if we found at least one author
                     references.append(ref)
         
-        return title, authors, date, references
+        return ArticleMetadata(
+            title=title,
+            authors=authors,
+            published_date=published_date,
+            volume=volume,
+            issue=issue,
+            page_first=page_first,
+            page_last=page_last,
+            citations=citations,
+            doi=doi,
+            references=references
+        )
         
     except Exception as e:
         print(f"Error parsing HTML file: {str(e)}")
-        return None, [], None, []
+        return ArticleMetadata(
+            title=None,
+            authors=[],
+            published_date=None,
+            volume=None,
+            issue=None,
+            page_first=None,
+            page_last=None,
+            citations=None,
+            doi=None,
+            references=[]
+        )
 
 if __name__ == "__main__":
     # Example usage
     import sys
     if len(sys.argv) > 1:
         file_path = sys.argv[1]
-        title, authors, date, references = parse_wiley_html(file_path)
-        print(f"Title: {title}")
-        print(f"Authors: {authors}")
-        print(f"Date: {date}")
+        metadata = parse_wiley_html(file_path)
+        print(f"Title: {metadata.title}")
+        print(f"Authors: {metadata.authors}")
+        print(f"Published Date: {metadata.published_date}")
+        print(f"Volume: {metadata.volume}")
+        print(f"Issue: {metadata.issue}")
+        print(f"Pages: {metadata.page_first}-{metadata.page_last}")
+        print(f"Citations: {metadata.citations}")
+        print(f"DOI: {metadata.doi}")
         print("\nReferences:")
-        for i, ref in enumerate(references, 1):
-            print(f"\n{i}. Authors: {ref.authors}")
+        for i, ref in enumerate(metadata.references, 1):
+            print(f"\n{i}. Reference Type: {ref.ref_type}")
+            print(f"   Authors: {ref.authors}")
             print(f"   Year: {ref.year}")
             print(f"   Title: {ref.title}")
             print(f"   Journal: {ref.journal}")
             print(f"   Volume: {ref.volume}")
             print(f"   Pages: {ref.page_first}-{ref.page_last}")
             print(f"   DOI: {ref.doi}")
-            print(f"   Reference Type: {ref.ref_type}")
-            print(f"   Working Paper Institution: {ref.working_paper_institution}")
-            print(f"   Book Title: {ref.book_title}")
-            print(f"   Chapter Title: {ref.chapter_title}")
+            if ref.ref_type == ReferenceType.WORKING_PAPER:
+                print(f"   Working Paper Institution: {ref.working_paper_institution}")
+            elif ref.ref_type == ReferenceType.BOOK:
+                print(f"   Book Title: {ref.book_title}")
+                if ref.chapter_title:
+                    print(f"   Chapter Title: {ref.chapter_title}")
     else:
         print("Please provide an HTML file path as argument")

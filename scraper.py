@@ -20,6 +20,7 @@ from math import comb
 import traceback
 import pyautogui
 import numpy as np
+import pandas as pd
 
 # List of realistic user agents
 USER_AGENTS = [
@@ -506,160 +507,104 @@ def process_papers_from_csv(csv_path: str = "data/JF.csv", journal: str = "the j
         csv_path: Path to CSV file containing paper titles
         journal: Journal name for search filtering
     """
+    # Read CSV file
+    df = pd.read_csv(csv_path, header=None, names=['Title', 'HTML', 'DOI', 'Source'])
+    
+    # Initialize driver
+    driver = init_driver()
+    
     try:
-        # Read all papers first
-        all_papers = []
-        with open(csv_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            fieldnames = reader.fieldnames or ['title', 'hash.html', 'doi', 'source']
-            all_papers = list(reader)
-
-        # Create output directory if it doesn't exist
-        os.makedirs("downloaded_html", exist_ok=True)
-
-        # Process papers in batches to restart browser periodically
-        batch_size = random.randint(4, 6)  # Random batch size around 5
-        current_batch = 0
-        driver = None
-        papers_processed_in_batch = 0  # Counter for papers actually processed in current batch
+        # Warm up the browser first
+        print("\nWarming up browser...")
+        driver.get("https://scholar.google.com")
+        random_delay(2, 3)
         
-        def init_browser_with_warmup():
-            """Initialize browser and do warm-up searches on Google Scholar"""
-            print(f"\nStarting new browser instance (batch {current_batch + 1})...")
-            new_driver = init_driver()
-            
-            # First visit Google Scholar main page
-            print("\nVisiting Google Scholar main page...")
-            new_driver.get("https://scholar.google.com")
-            random_delay(2, 3)
-            
-            # Do 2-3 background searches
-            num_searches = random.randint(2, 3)
-            for i in range(num_searches):
-                search = get_random_background_search()
-                print(f"\nDoing background search {i+1}/{num_searches}: {search}")
-                new_driver.get(f"https://scholar.google.com/scholar?q={urllib.parse.quote(search)}")
-                random_delay(2, 3)
-                
-                # Check for captcha
-                if is_cloudflare_captcha(new_driver):
-                    print("Hit Cloudflare captcha during warm-up")
-                    return None
-                
-                # Add natural scrolling and interaction
-                add_random_scroll(new_driver)
-                random_delay(1, 2)
-            
-            return new_driver
+        # Do 2-3 background searches
+        num_searches = random.randint(2, 3)
+        searches = get_random_financial_searches(num_searches)
         
-        try:
-            total_papers = len(all_papers)
-            for i, paper in enumerate(all_papers):
-                # Start new browser instance when batch limit reached
-                if papers_processed_in_batch >= batch_size:
-                    if driver:
-                        print("\nClosing browser for routine rotation...")
-                        driver.quit()
-                    driver = init_browser_with_warmup()
-                    if not driver:  # Hit captcha during warm-up
-                        print("\nStopping due to captcha during browser warm-up. Please wait a while before retrying.")
-                        break
-                    current_batch += 1
-                    papers_processed_in_batch = 0  # Reset counter for new batch
-                
-                # Initialize driver if this is the first paper
-                if not driver:
-                    driver = init_browser_with_warmup()
-                    if not driver:  # Hit captcha during warm-up
-                        print("\nStopping due to captcha during browser warm-up. Please wait a while before retrying.")
-                        break
-                    current_batch += 1
-                
-                title = paper['title']
-                if not title:  # Skip empty titles
-                    continue
-
-                # Get current values, handling empty fields
-                current_doi = (paper.get('doi') or '').strip()
-                current_source = (paper.get('source') or '').strip()
-                
-                print(f"\nProcessing paper {i+1} of {total_papers}: {title}")
-                
-                # Skip if:
-                # 1. Has a valid DOI (not empty, None, NA, or CAPTCHA)
-                # 2. Was previously marked as NA
-                # Only process if:
-                # 1. No data yet (empty/blank fields)
-                # 2. Marked as CAPTCHA (to retry)
-                # 3. Has "None" as DOI (from old runs)
-                if current_doi and current_doi != 'CAPTCHA':
-                    if current_doi == 'NA' or (current_doi != 'None' and '.' in current_doi):
-                        print(f"Skipping already processed paper: {title}")
-                        continue
-
-                print(f"\nProcessing paper {i+1} of {total_papers}: {title}")
-                papers_processed_in_batch += 1  # Increment counter only for papers we actually process
-                
-                # Try to get metadata using the same driver instance
-                doi, html_file = get_doi_from_google_scholar(driver, title, journal)
-                
-                if doi == "CAPTCHA":
-                    # Mark as CAPTCHA to retry later
-                    paper['hash.html'] = 'CAPTCHA'
-                    paper['doi'] = 'CAPTCHA'
-                    paper['source'] = 'CAPTCHA'
-                    print(f"Hit captcha - marking for retry: {title}")
-                elif doi and html_file:
-                    # Determine source from the DOI or URL
-                    source = "wiley" if "10.1111" in doi else "jstor"
-                    
-                    # Update the paper's data in place
-                    paper['hash.html'] = html_file.split('\\')[-1] if html_file else ''
-                    paper['doi'] = doi
-                    paper['source'] = source
-                else:
-                    # Paper not found - fill with "NA" values
-                    paper['hash.html'] = 'NA'
-                    paper['doi'] = 'NA'
-                    paper['source'] = 'NA'
-                    print(f"Paper not found - marking as NA: {title}")
-
-                # Write all papers back to CSV after each update
-                with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.DictWriter(f, fieldnames=all_papers[0].keys())
-                    writer.writeheader()
-                    writer.writerows(all_papers)
-
-                # If we hit a captcha, stop processing and close the browser
-                if doi == "CAPTCHA":
-                    print("\nStopping due to captcha. Please wait a while before retrying.")
-                    break
-
-                # Add a longer delay between papers to be nice to Google Scholar
-                if i < total_papers - 1:  # Don't delay after the last paper
-                    delay = random.uniform(5, 7)  # Increased delay between papers
-                    print(f"\nWaiting {delay:.1f} seconds before next paper...")
-                    time.sleep(delay)
-
-        finally:
-            # Only close the driver at the very end
-            if driver:
-                try:
-                    print("\nClosing browser...")
-                    driver.quit()
-                except Exception as e:
-                    print(f"Error closing driver: {str(e)}")
-
-    except Exception as e:
-        print(f"Error processing papers: {str(e)}")
-        traceback.print_exc()
-        # Make sure to quit the driver even if we hit an error
-        try:
-            if 'driver' in locals() and driver:
-                print("\nClosing browser due to error...")
+        for search in searches:
+            print(f"\nDoing background search: {search}")
+            driver.get(f"https://scholar.google.com/scholar?q={urllib.parse.quote(search)}")
+            random_delay(1, 2)
+            
+            # Check for captcha
+            if is_cloudflare_captcha(driver):
+                print("Hit Cloudflare captcha during warmup")
                 driver.quit()
-        except:
-            pass
+                return
+            
+            # Add natural scrolling and hovering
+            add_random_scroll(driver)
+            random_delay(1, 1.5)
+            
+            # Try to click a random result
+            citations = driver.find_elements(By.CSS_SELECTOR, ".gs_r, .gs_rt a")
+            if citations:
+                citation = random.choice(citations)
+                try:
+                    if move_to_element_realistic(driver, citation):
+                        random_delay(1, 1.5)
+                except:
+                    pass
+        
+        # Process each paper
+        papers_processed = 0
+        for idx, row in df.iterrows():
+            title = row['Title']
+            html = row['HTML']
+            doi = row['DOI']
+            source = row['Source']
+            
+            # Skip if we already have this paper
+            if pd.notna(html) and pd.notna(doi) and pd.notna(source):
+                print(f"\nSkipping already processed paper: {title}")
+                continue
+            
+            print(f"\nProcessing paper {papers_processed + 1}: {title}")
+            
+            # Try to get DOI from Google Scholar
+            try:
+                new_doi, html_file = get_doi_from_google_scholar(driver, title, journal)
+                
+                if new_doi == "CAPTCHA":
+                    print("Hit CAPTCHA - stopping for now")
+                    break
+                
+                if new_doi:
+                    # Update dataframe with new information
+                    df.at[idx, 'DOI'] = new_doi
+                    df.at[idx, 'HTML'] = html_file
+                    df.at[idx, 'Source'] = 'wiley' if 'wiley' in new_doi else 'jstor'
+                    
+                    # Save progress after each successful paper
+                    df.to_csv(csv_path, index=False, header=False)
+                    print(f"Saved paper info: DOI={new_doi}")
+                    papers_processed += 1
+                    
+                else:
+                    print(f"Paper not found - marking as NA: {title}")
+                    df.at[idx, 'DOI'] = 'NA'
+                    df.at[idx, 'HTML'] = 'NA'
+                    df.at[idx, 'Source'] = 'NA'
+                    df.to_csv(csv_path, index=False, header=False)
+                
+                # Random delay between papers
+                random_delay(2, 4)
+                
+            except Exception as e:
+                print(f"Error processing paper: {str(e)}")
+                traceback.print_exc()
+                continue
+            
+    except Exception as e:
+        print(f"Fatal error: {str(e)}")
+        traceback.print_exc()
+    
+    finally:
+        # Save final state
+        df.to_csv(csv_path, index=False, header=False)
+        driver.quit()
 
 def is_cloudflare_captcha(driver) -> bool:
     """

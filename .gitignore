@@ -1,5 +1,6 @@
 # Archive folder
 archive/
+downloaded_html/
 
 # Python virtual environment
 venv/
