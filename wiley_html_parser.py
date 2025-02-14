@@ -4,6 +4,10 @@ from typing import List, Optional, Tuple
 from enum import Enum
 import re
 from datetime import datetime
+import os
+import pickle
+from dataclasses import asdict
+from pathlib import Path
 
 class ReferenceType(Enum):
     ARTICLE = "article"
@@ -492,34 +496,62 @@ def parse_wiley_html(file_path: str) -> ArticleMetadata:
         )
 
 if __name__ == "__main__":
-    # Example usage
-    import sys
-    if len(sys.argv) > 1:
-        file_path = sys.argv[1]
-        metadata = parse_wiley_html(file_path)
-        print(f"Title: {metadata.title}")
-        print(f"Authors: {metadata.authors}")
-        print(f"Published Date: {metadata.published_date}")
-        print(f"Volume: {metadata.volume}")
-        print(f"Issue: {metadata.issue}")
-        print(f"Pages: {metadata.page_first}-{metadata.page_last}")
-        print(f"Citations: {metadata.citations}")
-        print(f"DOI: {metadata.doi}")
-        print("\nReferences:")
-        for i, ref in enumerate(metadata.references, 1):
-            print(f"\n{i}. Reference Type: {ref.ref_type}")
-            print(f"   Authors: {ref.authors}")
-            print(f"   Year: {ref.year}")
-            print(f"   Title: {ref.title}")
-            print(f"   Journal: {ref.journal}")
-            print(f"   Volume: {ref.volume}")
-            print(f"   Pages: {ref.page_first}-{ref.page_last}")
-            print(f"   DOI: {ref.doi}")
-            if ref.ref_type == ReferenceType.WORKING_PAPER:
-                print(f"   Working Paper Institution: {ref.working_paper_institution}")
-            elif ref.ref_type == ReferenceType.BOOK:
-                print(f"   Book Title: {ref.book_title}")
-                if ref.chapter_title:
-                    print(f"   Chapter Title: {ref.chapter_title}")
-    else:
-        print("Please provide an HTML file path as argument")
+    import os
+    import pickle
+    from dataclasses import asdict
+    from pathlib import Path
+
+    # Get all HTML files in downloaded_html directory
+    html_dir = Path("downloaded_html")
+    html_files = list(html_dir.glob("*.html"))
+    
+    # Process each file and store metadata in a list
+    all_metadata = []
+    for html_file in html_files:
+        print(f"Processing {html_file}...")
+        try:
+            metadata = parse_wiley_html(str(html_file))
+            # Convert metadata object to dict, including nested objects
+            metadata_dict = {
+                'title': metadata.title,
+                'authors': metadata.authors,
+                'published_date': metadata.published_date,
+                'volume': metadata.volume,
+                'issue': metadata.issue,
+                'page_first': metadata.page_first,
+                'page_last': metadata.page_last,
+                'citations': metadata.citations,
+                'doi': metadata.doi,
+                'references': []
+            }
+            
+            # Convert each reference to dict
+            for ref in metadata.references:
+                ref_dict = {
+                    'ref_type': ref.ref_type.value if ref.ref_type else None,
+                    'authors': ref.authors,
+                    'year': ref.year,
+                    'title': ref.title,
+                    'journal': ref.journal,
+                    'volume': ref.volume,
+                    'page_first': ref.page_first,
+                    'page_last': ref.page_last,
+                    'doi': ref.doi,
+                    'working_paper_institution': ref.working_paper_institution,
+                    'book_title': ref.book_title,
+                    'chapter_title': ref.chapter_title
+                }
+                metadata_dict['references'].append(ref_dict)
+            
+            all_metadata.append(metadata_dict)
+            print(f"Successfully processed {metadata_dict['title']}")
+        except Exception as e:
+            print(f"Error processing {html_file}: {e}")
+    
+    # Save the metadata list to a binary file
+    output_file = "JF_articles.pkl"
+    with open(output_file, 'wb') as f:
+        pickle.dump(all_metadata, f)
+    
+    print(f"\nProcessed {len(all_metadata)} articles")
+    print(f"Data saved to {output_file}")
