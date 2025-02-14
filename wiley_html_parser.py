@@ -46,30 +46,15 @@ class ArticleMetadata:
     references: List[Reference]
 
 def clean_text(text: str) -> str:
-    """Clean text by removing extra whitespace and special characters"""
+    """Clean text by removing extra whitespace and normalizing characters."""
     if not text:
         return ""
-        
-    # First remove any DOI-like patterns and following text
-    text = re.sub(r'10\.\d{4,}.*$', '', text)
-    
-    # Remove citation links and other common noise
-    text = re.sub(r'Web of Science®|Google Scholar|CrossRef|PubMed|Scopus', '', text)
-    
-    # Remove any text after a page number pattern
-    text = re.sub(r'\d+[-–]\d+.*$', '', text)
-    text = re.sub(r'\d+\s+[A-Za-z].*$', '', text)
-    
-    # Clean up whitespace
+    # Replace any weird whitespace characters with a single space
     text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'[\r\n\t]', '', text)
-    
-    # Remove any trailing parentheticals
-    text = re.sub(r'\s*\([^)]*\)\s*$', '', text)
-    
-    # Remove any text after a year pattern
-    text = re.sub(r'\s*(19|20)\d{2}.*$', '', text)
-    
+    # Remove any trailing punctuation except for closing parentheses
+    text = re.sub(r'[.,;:\s]+$', '', text)
+    # Remove any leading whitespace or punctuation
+    text = re.sub(r'^[.,;:\s]+', '', text)
     return text.strip()
 
 def clean_journal(text: str) -> str:
@@ -226,7 +211,7 @@ def parse_reference(ref_elem) -> Reference:
             if year_elem:
                 # Get text after the year up to "Working paper"
                 after_year = full_text[full_text.find(year_elem.get_text()) + len(year_elem.get_text()):]
-                title_match = re.search(r',\s*([^,]+?)(?:\s+Working\s+paper)', after_year, re.IGNORECASE)
+                title_match = re.search(r',\s*([^,]*?(?:\([^)]*\)[^,]*?)*)(?:\s*,\s*Working\s+paper)', after_year, re.IGNORECASE)
                 if title_match:
                     ref.title = clean_text(title_match.group(1))
             
@@ -370,8 +355,10 @@ def parse_wiley_html(file_path: str) -> ArticleMetadata:
             soup = BeautifulSoup(f, 'html.parser')
         
         # Extract title
+        title = None
         title_elem = soup.find('h1', class_='citation__title')
-        title = clean_text(title_elem.text) if title_elem else None
+        if title_elem:
+            title = title_elem.get_text().strip()
         
         # Extract authors (using set to remove duplicates)
         authors = []
@@ -495,15 +482,20 @@ def parse_wiley_html(file_path: str) -> ArticleMetadata:
             references=[]
         )
 
-if __name__ == "__main__":
-    import os
-    import pickle
-    from dataclasses import asdict
-    from pathlib import Path
-
-    # Get all HTML files in downloaded_html directory
-    html_dir = Path("downloaded_html")
-    html_files = list(html_dir.glob("*.html"))
+def process_html_files(html_dir: str, output_file: str) -> List[dict]:
+    """
+    Process all HTML files in the specified directory and save metadata to a binary file.
+    
+    Args:
+        html_dir: Path to directory containing HTML files
+        output_file: Path to save the output pickle file
+    
+    Returns:
+        List of dictionaries containing metadata for each article
+    """
+    # Get all HTML files in directory
+    html_path = Path(html_dir)
+    html_files = list(html_path.glob("*.html"))
     
     # Process each file and store metadata in a list
     all_metadata = []
@@ -549,9 +541,48 @@ if __name__ == "__main__":
             print(f"Error processing {html_file}: {e}")
     
     # Save the metadata list to a binary file
-    output_file = "JF_articles.pkl"
     with open(output_file, 'wb') as f:
         pickle.dump(all_metadata, f)
     
     print(f"\nProcessed {len(all_metadata)} articles")
     print(f"Data saved to {output_file}")
+    
+    return all_metadata
+
+def test_single_file(file_path: str) -> None:
+    """
+    Test parsing of a single HTML file and print the results.
+    
+    Args:
+        file_path: Path to the HTML file to parse
+    """
+    metadata = parse_wiley_html(file_path)
+    print(f"Title: {metadata.title}")
+    print(f"Authors: {metadata.authors}")
+    print(f"Published Date: {metadata.published_date}")
+    print(f"Volume: {metadata.volume}")
+    print(f"Issue: {metadata.issue}")
+    print(f"Pages: {metadata.page_first}-{metadata.page_last}")
+    print(f"Citations: {metadata.citations}")
+    print(f"DOI: {metadata.doi}")
+    print("\nReferences:")
+    for i, ref in enumerate(metadata.references, 1):
+        print(f"\n{i}. Reference Type: {ref.ref_type.value if ref.ref_type else None}")
+        print(f"   Authors: {ref.authors}")
+        print(f"   Year: {ref.year}")
+        print(f"   Title: {ref.title}")
+        if ref.ref_type == ReferenceType.ARTICLE:
+            print(f"   Journal: {ref.journal}")
+            print(f"   Volume: {ref.volume}")
+            print(f"   Pages: {ref.page_first}-{ref.page_last}")
+        elif ref.ref_type == ReferenceType.WORKING_PAPER:
+            print(f"   Working Paper Institution: {ref.working_paper_institution}")
+        elif ref.ref_type == ReferenceType.BOOK:
+            print(f"   Book Title: {ref.book_title}")
+            if ref.chapter_title:
+                print(f"   Chapter Title: {ref.chapter_title}")
+        print(f"   DOI: {ref.doi}")
+
+if __name__ == "__main__":
+    # Process files in downloaded_html directory and save to JF_articles.pkl
+    process_html_files("downloaded_html", "JF_articles.pkl")
