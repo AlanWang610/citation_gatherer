@@ -5,9 +5,11 @@ from enum import Enum
 import re
 from datetime import datetime
 import os
-import pickle
+import json
+import csv
 from dataclasses import asdict
 from pathlib import Path
+import pandas as pd
 
 class ReferenceType(Enum):
     ARTICLE = "article"
@@ -482,44 +484,64 @@ def parse_wiley_html(file_path: str) -> ArticleMetadata:
             references=[]
         )
 
-def process_html_files(html_dir: str, output_file: str) -> List[dict]:
+def process_html_files(html_dir: str, output_file_json: str, output_file_csv: str) -> List[dict]:
     """
-    Process all HTML files in the specified directory and save metadata to a binary file.
+    Process all HTML files in the specified directory and save metadata to JSON and CSV files.
     
     Args:
         html_dir: Path to directory containing HTML files
-        output_file: Path to save the output pickle file
+        output_file_json: Path to save the output JSON file
+        output_file_csv: Path to save the output CSV file
     
     Returns:
         List of dictionaries containing metadata for each article
     """
-    # Get all HTML files in directory
-    html_path = Path(html_dir)
-    html_files = list(html_path.glob("*.html"))
-    
-    # Process each file and store metadata in a list
+    html_files = list(Path(html_dir).glob('*.html'))
     all_metadata = []
+    csv_data = []
+    
     for html_file in html_files:
         print(f"Processing {html_file}...")
         try:
             metadata = parse_wiley_html(str(html_file))
-            # Convert metadata object to dict, including nested objects
-            metadata_dict = {
-                'title': metadata.title,
-                'authors': metadata.authors,
-                'published_date': metadata.published_date,
-                'volume': metadata.volume,
-                'issue': metadata.issue,
-                'page_first': metadata.page_first,
-                'page_last': metadata.page_last,
-                'citations': metadata.citations,
-                'doi': metadata.doi,
-                'references': []
+            
+            # Base article metadata
+            article_metadata = {
+                'article.title': metadata.title,
+                'article.authors': ';'.join(metadata.authors),
+                'article.published_date': metadata.published_date.isoformat() if metadata.published_date else None,
+                'article.volume': metadata.volume,
+                'article.issue': metadata.issue,
+                'article.page_first': metadata.page_first,
+                'article.page_last': metadata.page_last,
+                'article.citations': metadata.citations,
+                'article.doi': metadata.doi,
             }
             
-            # Convert each reference to dict
+            # Create a row for each reference
             for ref in metadata.references:
                 ref_dict = {
+                    'reference.ref_type': ref.ref_type.value if ref.ref_type else None,
+                    'reference.authors': ';'.join(ref.authors),
+                    'reference.year': ref.year,
+                    'reference.title': ref.title,
+                    'reference.journal': ref.journal,
+                    'reference.volume': ref.volume,
+                    'reference.page_first': ref.page_first,
+                    'reference.page_last': ref.page_last,
+                    'reference.doi': ref.doi,
+                    'reference.working_paper_institution': ref.working_paper_institution,
+                    'reference.book_title': ref.book_title,
+                    'reference.chapter_title': ref.chapter_title
+                }
+                
+                # Combine article metadata with reference data
+                row = {**article_metadata, **ref_dict}
+                csv_data.append(row)
+            
+            # Store complete metadata for JSON
+            metadata_dict = {**article_metadata, 'references': [
+                {
                     'ref_type': ref.ref_type.value if ref.ref_type else None,
                     'authors': ref.authors,
                     'year': ref.year,
@@ -532,20 +554,25 @@ def process_html_files(html_dir: str, output_file: str) -> List[dict]:
                     'working_paper_institution': ref.working_paper_institution,
                     'book_title': ref.book_title,
                     'chapter_title': ref.chapter_title
-                }
-                metadata_dict['references'].append(ref_dict)
-            
+                } for ref in metadata.references
+            ]}
             all_metadata.append(metadata_dict)
-            print(f"Successfully processed {metadata_dict['title']}")
+            print(f"Successfully processed {metadata_dict['article.title']}")
         except Exception as e:
             print(f"Error processing {html_file}: {e}")
     
-    # Save the metadata list to a binary file
-    with open(output_file, 'wb') as f:
-        pickle.dump(all_metadata, f)
+    # Save JSON
+    with open(output_file_json, 'w', encoding='utf-8') as f:
+        json.dump(all_metadata, f, ensure_ascii=False, indent=2)
+    
+    # Save CSV efficiently using pandas
+    if csv_data:
+        df = pd.DataFrame(csv_data)
+        df.to_csv(output_file_csv, index=False, encoding='utf-8')
     
     print(f"\nProcessed {len(all_metadata)} articles")
-    print(f"Data saved to {output_file}")
+    print(f"JSON data saved to {output_file_json}")
+    print(f"CSV data saved to {output_file_csv}")
     
     return all_metadata
 
@@ -584,5 +611,5 @@ def test_single_file(file_path: str) -> None:
         print(f"   DOI: {ref.doi}")
 
 if __name__ == "__main__":
-    # Process files in downloaded_html directory and save to JF_articles.pkl
-    process_html_files("downloaded_html", "JF_articles.pkl")
+    # Process files in downloaded_html directory and save to JF_articles.json
+    process_html_files("downloaded_html", "JF_articles.json", "JF_articles.csv")
