@@ -612,4 +612,4 @@ def test_single_file(file_path: str) -> None:
 
 if __name__ == "__main__":
     # Process files in downloaded_html directory and save to JF_articles.json
-    process_html_files("downloaded_html", "JF_articles.json", "JF_articles.csv")
+    process_html_files("downloaded_html/JF", "JF_articles.json", "JF_articles.csv")
