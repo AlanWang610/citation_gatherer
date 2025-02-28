@@ -14,3 +14,14 @@ __pycache__/
 # Operating System files
 .DS_Store
 Thumbs.db
+
+# Environment variables
+.env
+
+# Output files
+*.json
+*.csv
+*.txt
+*.html
+*.xml
+*.jsonl
