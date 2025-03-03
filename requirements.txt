@@ -1,7 +1,4 @@
-selenium==4.11.2
-pyautogui==0.9.54
-pandas==2.2.0
-webdriver-manager==4.0.1
-requests==2.31.0
-numpy==1.26.3
-beautifulsoup4==4.13.3
+beautifulsoup4
+pandas
+python-dotenv
+openai

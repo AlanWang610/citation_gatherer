@@ -349,6 +349,7 @@ async def parse_reference(ref_elem) -> Reference:
             'brookings paper',
             'nber paper',
             'unpublished paper',
+            'unpublished',  # Added "unpublished" as trigger
             'mimeo',
             'manuscript',
             'work in progress'
@@ -402,12 +403,13 @@ async def parse_reference(ref_elem) -> Reference:
                         authors_text = authors_div.get_text()
                         ref.authors = parse_authors(authors_text)
             
-            # Only use LLM if we're missing the institution
-            if not ref.working_paper_institution:
+            # Modified LLM backup condition for working papers
+            if not ref.title or not ref.working_paper_institution:
                 backup_result = await llm_backup(ref_elem.get_text(), ReferenceType.WORKING_PAPER)
-                ref.title = backup_result.get('title') or ref.title
-                ref.working_paper_institution = backup_result.get('institution') or ref.working_paper_institution
-                ref.year = backup_result.get('year') or ref.year
+                # Let LLM results override our naive detection
+                ref.title = backup_result.get('title')
+                ref.working_paper_institution = backup_result.get('institution')
+                ref.year = backup_result.get('year')
             return ref
         
         # If not a working paper, continue with normal parsing...
@@ -429,7 +431,7 @@ async def parse_reference(ref_elem) -> Reference:
         if host_div:
             host_text = host_div.get_text().strip()
             
-            # Check if it's a book by looking for editors, publishers, or common publishing locations
+            # Check if it's a book
             book_indicators = [
                 '(Eds.)', '(Ed.)',  # Editors
                 'Elsevier', 'Press', 'Publisher',  # Publishers
@@ -439,10 +441,13 @@ async def parse_reference(ref_elem) -> Reference:
             
             if any(indicator in host_text for indicator in book_indicators):
                 ref.ref_type = ReferenceType.BOOK
-                backup_result = await llm_backup(host_text, ReferenceType.BOOK)
-                ref.book_title = backup_result.get('book_title')
-                ref.chapter_title = backup_result.get('chapter_title')
-                ref.year = backup_result.get('year')
+                # Modified LLM backup condition for books
+                if not ref.book_title or not ref.year:
+                    backup_result = await llm_backup(host_text, ReferenceType.BOOK)
+                    # Let LLM results override our naive detection
+                    ref.book_title = backup_result.get('book_title')
+                    ref.year = backup_result.get('year')
+                    ref.chapter_title = backup_result.get('chapter_title')
                 return ref
             
             # First try to match the standard journal format exactly
@@ -454,15 +459,17 @@ async def parse_reference(ref_elem) -> Reference:
                 ref.year = standard_journal_match.group(3)
                 ref.page_first = standard_journal_match.group(4)
                 ref.page_last = standard_journal_match.group(5)
-            else:
-                # If it's not a standard format, use LLM backup
+            
+            # Modified LLM backup condition for articles
+            if not ref.title or not ref.journal or not ref.year:
                 backup_result = await llm_backup(host_text, ref.ref_type)
-                if ref.ref_type == ReferenceType.ARTICLE:
-                    ref.journal = backup_result.get('journal')
-                    ref.volume = backup_result.get('volume')
-                    ref.year = backup_result.get('year')
-                    ref.page_first = backup_result.get('page_first')
-                    ref.page_last = backup_result.get('page_last')
+                # Let LLM results override our naive detection
+                ref.title = backup_result.get('title')
+                ref.journal = backup_result.get('journal')
+                ref.year = backup_result.get('year')
+                ref.volume = backup_result.get('volume')
+                ref.page_first = backup_result.get('page_first')
+                ref.page_last = backup_result.get('page_last')
             return ref
         
         # Extract DOI if present
@@ -613,7 +620,6 @@ async def process_references(ref_items) -> List[Reference]:
 def process_single_file(file_path: str) -> Optional[dict]:
     """Process a single HTML file and return its metadata as a dictionary"""
     try:
-        print(f"Processing {file_path}...")
         metadata = asyncio.run(parse_sciencedirect_html_async(str(file_path)))
         
         # Base article metadata
@@ -644,11 +650,16 @@ def process_single_file(file_path: str) -> Optional[dict]:
                 } for ref in metadata.references
             ]
         }
-        print(f"Successfully processed {article_metadata['article.title']}")
         return article_metadata
     except Exception as e:
         print(f"Error processing {file_path}: {e}")
         return None
+
+def process_with_progress(args):
+    """Process a single file with progress reporting"""
+    index, file_path = args
+    print(f"Processing: {Path(file_path).name}")
+    return process_single_file(file_path)
 
 def process_html_files(html_dir: str, output_file_json: str, output_file_csv: str) -> List[dict]:
     """
@@ -664,10 +675,14 @@ def process_html_files(html_dir: str, output_file_json: str, output_file_csv: st
         List of dictionaries containing metadata for each article
     """
     html_files = list(Path(html_dir).glob('*.html'))
+    total_files = len(html_files)
+    print(f"\nFound {total_files} HTML files to process...")
     
-    # Process files in parallel using 4 cores
-    with Pool(processes=4) as pool:
-        all_metadata = list(filter(None, pool.map(process_single_file, html_files)))
+    # Process files in parallel using 12 cores
+    with Pool(processes=12) as pool:
+        # Create list of tuples with index and file path
+        indexed_files = list(enumerate(html_files))
+        all_metadata = list(filter(None, pool.map(process_with_progress, indexed_files)))
     
     # Prepare CSV data
     csv_data = []
