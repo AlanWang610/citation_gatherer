@@ -454,8 +454,6 @@ class ScienceDirectParser(BaseParser):
                 doi_href = doi_elem['href']
                 if doi_href.startswith('https://doi.org/'):
                     ref.doi = doi_href[len('https://doi.org/'):]
-                elif doi_href.startswith('http://dx.doi.org/'):
-                    ref.doi = doi_href[len('http://dx.doi.org/'):]
             
             # Use LLM backup if needed
             if ref.ref_type == ReferenceType.ARTICLE and (not ref.title or not ref.journal or not ref.year):
@@ -552,6 +550,16 @@ class ScienceDirectParser(BaseParser):
                         if ref.authors:  # Only add if we found at least one author
                             references.append(ref)
             
+            # Extract citation count
+            citations = None
+            metrics_elem = soup.find('li', class_='text-xs metrics')
+            if metrics_elem:
+                citation_text = metrics_elem.find_all('span')[-1].get_text()  # Get the last span
+                try:
+                    citations = int(citation_text)
+                except (ValueError, TypeError):
+                    citations = None
+            
             return ArticleMetadata(
                 title=title,
                 authors=authors,
@@ -560,7 +568,7 @@ class ScienceDirectParser(BaseParser):
                 issue=issue,
                 page_first=page_first,
                 page_last=page_last,
-                citations=None,  # ScienceDirect doesn't provide citation count
+                citations=citations,
                 doi=doi,
                 references=references
             )
@@ -1106,6 +1114,6 @@ class OUPParser(BaseParser):
 
 if __name__ == "__main__":
     # Test a single ScienceDirect file
-    test_file = "downloaded_html\JFE\_science_article_pii_S0304405X0000057X.html"
+    test_file = "downloaded_html\JFE\_science_article_pii_S0304405X0000060X.html"
     print("Testing ScienceDirect parser on single file...")
     asyncio.run(test_single_file(test_file, "sciencedirect"))
