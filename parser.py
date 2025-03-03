@@ -1113,7 +1113,9 @@ class OUPParser(BaseParser):
             )
 
 if __name__ == "__main__":
-    # Test a single ScienceDirect file
-    test_file = "downloaded_html\JFE\_science_article_pii_S0304405X0000060X.html"
-    print("Testing ScienceDirect parser on single file...")
-    asyncio.run(test_single_file(test_file, "sciencedirect"))
+    # Process all JF articles using Wiley parser
+    html_dir = "downloaded_html/JF"
+    output_json = "JF_articles.json"
+    output_csv = "JF_articles.csv"
+    print("Processing Journal of Finance articles...")
+    asyncio.run(process_html_files(html_dir, output_json, output_csv, "wiley"))
