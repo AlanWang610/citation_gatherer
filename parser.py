@@ -119,9 +119,12 @@ class BaseParser:
     async def llm_backup(self, text: str, ref_type: ReferenceType) -> dict:
         """Async backup function that uses LLM to parse reference text when regular parsing fails"""
         load_dotenv()
-        openai.api_key = os.getenv('OPENAI_API_KEY')
+        client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
         self.llm_call_counter += 1
+        # Add delay between concurrent LLM calls to avoid rate limits
+        if self.llm_call_counter > 1:
+            await asyncio.sleep(0.05)  # 50ms delay
         
         if ref_type == ReferenceType.ARTICLE:
             system_prompt = """Please take this input, which is in the form {article: string} and identify the title, journal, year of publication, volume, and first and last page numbers. Respond with a JSON object containing these fields: "title", "journal", "year", "volume", "page_start", "page_end"."""
@@ -133,7 +136,7 @@ class BaseParser:
             system_prompt = """Please take this input, which is in the form {book: string} and identify the book title, chapter title, and year of publication. Respond with a JSON object containing these fields: "book_title", "chapter_title", "year"."""
             input_text = f"{{book: {text}}}"
 
-        max_retries = 3
+        max_retries = 50
         retry_delay = 30
 
         for attempt in range(max_retries):
@@ -142,7 +145,7 @@ class BaseParser:
                 with ThreadPoolExecutor() as pool:
                     response = await loop.run_in_executor(
                         pool,
-                        lambda: openai.ChatCompletion.create(
+                        lambda: client.chat.completions.create(
                             model="gpt-4o-mini-2024-07-18",
                             messages=[
                                 {"role": "system", "content": system_prompt},
@@ -164,7 +167,7 @@ class BaseParser:
             except Exception as e:
                 error_msg = str(e).lower()
                 if attempt < max_retries - 1 and ("rate" in error_msg or "429" in error_msg):
-                    print(f"Rate limit hit, waiting {retry_delay} seconds before retry...")
+                    print(f"Rate limit hit on attempt {attempt + 1}/{max_retries}, waiting {retry_delay} seconds before retry... Error: {str(e)}")
                     await asyncio.sleep(retry_delay)
                     continue
                 else:
@@ -251,10 +254,19 @@ async def process_single_file(file_path: str, parser: BaseParser, api_key: str, 
                 } for ref in metadata.references
             ]
         }
+        
         with counter.get_lock():
             counter.value += 1
             print(f"Progress: {counter.value}/{total_files} articles processed")
-        print(f"Successfully processed {article_metadata['article.title']} (API calls: {parser.llm_call_counter})")
+        print(f"Successfully processed {article_metadata['article.title']}")
+        
+        # Clean up metadata object
+        metadata.references = []
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
         return article_metadata
     except Exception as e:
         print(f"Error processing {file_path}: {e}")
@@ -278,17 +290,32 @@ async def process_html_files(html_dir: str, output_file_json: str, output_file_c
     # Create a shared counter for tracking progress
     counter = Value('i', 0)
     
-    # Process files in parallel using ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=4) as executor:
-        # Convert to list of strings for serialization
-        file_paths = [str(path) for path in html_files]
-        # Create partial function with parser, api_key, and counter
-        process_func = partial(process_single_file, parser=parser, api_key=api_key, counter=counter)
-        # Process files in parallel
-        tasks = [asyncio.create_task(process_func(file_path)) for file_path in file_paths]
-        all_metadata = await asyncio.gather(*tasks)
-        # Filter out None results from failed processing
-        all_metadata = [m for m in all_metadata if m is not None]
+    # Process files in smaller batches to manage memory
+    batch_size = 10
+    all_metadata = []
+    
+    for i in range(0, len(html_files), batch_size):
+        batch_files = html_files[i:i + batch_size]
+        print(f"\nProcessing batch {i//batch_size + 1} of {(len(html_files) + batch_size - 1)//batch_size}")
+        
+        # Process batch in parallel
+        with ProcessPoolExecutor(max_workers=4) as executor:
+            # Convert to list of strings for serialization
+            file_paths = [str(path) for path in batch_files]
+            # Create partial function with parser, api_key, and counter
+            process_func = partial(process_single_file, parser=parser, api_key=api_key, counter=counter)
+            # Process files in parallel
+            tasks = [asyncio.create_task(process_func(file_path)) for file_path in file_paths]
+            batch_results = await asyncio.gather(*tasks)
+            # Filter out None results from failed processing
+            batch_results = [m for m in batch_results if m is not None]
+            
+            # Add batch results to main list
+            all_metadata.extend(batch_results)
+            
+            # Force garbage collection after each batch
+            import gc
+            gc.collect()
     
     # Prepare CSV data
     csv_data = []
@@ -310,7 +337,6 @@ async def process_html_files(html_dir: str, output_file_json: str, output_file_c
     print(f"\nProcessed {len(all_metadata)} articles")
     print(f"JSON data saved to {output_file_json}")
     print(f"CSV data saved to {output_file_csv}")
-    print(f"Total LLM backup calls made: {parser.llm_call_counter}")
     
     return all_metadata
 
@@ -531,6 +557,7 @@ class ScienceDirectParser(BaseParser):
 
     async def parse_html(self, file_path: str) -> ArticleMetadata:
         """Parse a ScienceDirect HTML file to extract paper metadata"""
+        soup = None
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 soup = BeautifulSoup(f, 'html.parser')
@@ -639,6 +666,10 @@ class ScienceDirectParser(BaseParser):
                 page_last=None, citations=None, doi=None,
                 references=[]
             )
+        finally:
+            # Clean up BeautifulSoup object
+            if soup:
+                soup.decompose()
 
     def parse_authors(self, authors_text: str) -> List[str]:
         """Parse and format a list of authors"""
