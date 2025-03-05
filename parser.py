@@ -1233,9 +1233,9 @@ class OUPParser(BaseParser):
             )
 
 if __name__ == "__main__":
-    # Process all files in the JF folder
-    html_dir = "downloaded_html/JF"
-    output_json = "JF_articles.json"
-    output_csv = "JF_articles.csv"
-    print("Processing all Wiley JF articles...")
-    asyncio.run(process_html_files(html_dir, output_json, output_csv, "wiley"))
+    # Process all files in the JFE folder
+    html_dir = "downloaded_html/JFE"
+    output_json = "JFE_articles.json"
+    output_csv = "JFE_articles.csv"
+    print("Processing all ScienceDirect JFE articles...")
+    asyncio.run(process_html_files(html_dir, output_json, output_csv, "ScienceDirect"))
