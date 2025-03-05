@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 
 # Shared enums and dataclasses
 class ReferenceType(Enum):
@@ -107,6 +108,14 @@ class BaseParser:
         
         return text.strip()
 
+    def format_author_name(self, author: str) -> str:
+        """Format author name, converting 'Last, First' to 'First Last' format"""
+        if not author or ',' not in author:
+            return author
+        
+        last_name, first_name = author.split(',', 1)
+        return f"{first_name.strip()} {last_name.strip()}"
+
     async def llm_backup(self, text: str, ref_type: ReferenceType) -> dict:
         """Async backup function that uses LLM to parse reference text when regular parsing fails"""
         load_dotenv()
@@ -145,6 +154,11 @@ class BaseParser:
                     )
 
                 result = json.loads(response.choices[0].message.content)
+                
+                # Format author names if present in result
+                if 'authors' in result:
+                    result['authors'] = [self.format_author_name(author) for author in result['authors']]
+                
                 return self.map_result_to_output(result, ref_type)
 
             except Exception as e:
@@ -202,9 +216,12 @@ class ParserFactory:
         return parser_class()
 
 # Shared processing functions
-async def process_single_file(file_path: str, parser: BaseParser) -> Optional[dict]:
+async def process_single_file(file_path: str, parser: BaseParser, api_key: str) -> Optional[dict]:
     """Process a single HTML file and return its metadata as a dictionary"""
     try:
+        # Set the API key in the environment for this process
+        os.environ['OPENAI_API_KEY'] = api_key
+        
         print(f"Processing {file_path}...")
         metadata = await parser.parse_html(str(file_path))
         
@@ -243,18 +260,29 @@ async def process_single_file(file_path: str, parser: BaseParser) -> Optional[di
 
 async def process_html_files(html_dir: str, output_file_json: str, output_file_csv: str, platform: str) -> List[dict]:
     """Process all HTML files in the specified directory and save metadata to JSON and CSV files."""
+    # Load environment variables at the start
+    load_dotenv()
+    api_key = os.getenv('OPENAI_API_KEY')
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY not found in environment variables")
+
     html_files = list(Path(html_dir).glob('*.html'))
     total_files = len(html_files)
     print(f"\nFound {total_files} HTML files to process...")
     
     parser = ParserFactory.get_parser(platform)
     
-    # Process files
-    all_metadata = []
-    for file_path in html_files:
-        result = await process_single_file(file_path, parser)
-        if result:
-            all_metadata.append(result)
+    # Process files in parallel using ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=12) as executor:
+        # Convert to list of strings for serialization
+        file_paths = [str(path) for path in html_files]
+        # Create partial function with parser and api_key
+        process_func = partial(process_single_file, parser=parser, api_key=api_key)
+        # Process files in parallel
+        tasks = [asyncio.create_task(process_func(file_path)) for file_path in file_paths]
+        all_metadata = await asyncio.gather(*tasks)
+        # Filter out None results from failed processing
+        all_metadata = [m for m in all_metadata if m is not None]
     
     # Prepare CSV data
     csv_data = []
@@ -359,20 +387,27 @@ class ScienceDirectParser(BaseParser):
             is_working_paper = False
             working_paper_text = ""
             
-            # Check for working paper indicators in various elements
-            if contribution:
-                title_div = contribution.find('div', class_='title text-m')
-                if title_div and any(term in title_div.get_text().lower() for term in self.working_paper_terms):
+            # Check for working paper indicators in various elements and full text
+            ref_text = ref_elem.get_text().lower()
+            if any(term in ref_text for term in self.working_paper_terms):
+                is_working_paper = True
+                working_paper_text = ref_elem.get_text().strip()
+            
+            # Also check specific elements if not already found
+            if not is_working_paper:
+                if contribution:
+                    title_div = contribution.find('div', class_='title text-m')
+                    if title_div and any(term in title_div.get_text().lower() for term in self.working_paper_terms):
+                        is_working_paper = True
+                        working_paper_text = title_div.get_text()
+                
+                if host_div and any(term in host_div.get_text().lower() for term in self.working_paper_terms):
                     is_working_paper = True
-                    working_paper_text = title_div.get_text()
-            
-            if host_div and any(term in host_div.get_text().lower() for term in self.working_paper_terms):
-                is_working_paper = True
-                working_paper_text = host_div.get_text().strip()
-            
-            if other_ref and any(term in other_ref.get_text().lower() for term in self.working_paper_terms):
-                is_working_paper = True
-                working_paper_text = other_ref.get_text().strip()
+                    working_paper_text = host_div.get_text().strip()
+                
+                if other_ref and any(term in other_ref.get_text().lower() for term in self.working_paper_terms):
+                    is_working_paper = True
+                    working_paper_text = other_ref.get_text().strip()
             
             if is_working_paper:
                 ref.ref_type = ReferenceType.WORKING_PAPER
@@ -389,22 +424,24 @@ class ScienceDirectParser(BaseParser):
                         if title_match:
                             ref.title = self.clean_working_paper_title(self.clean_text(title_match.group(1)))
                 
-                # Try to find institution
+                # Try to find institution - use more flexible patterns
                 institution_match = None
-                if 'Working paper' in working_paper_text or 'working paper' in working_paper_text:
-                    institution_match = re.search(r'[Ww]orking paper,\s*(.*?)(?:[.,]|$)', working_paper_text)
-                elif any(term in working_paper_text for term in ['Dissertation', 'dissertation', 'Ph.D.', 'PhD']):
-                    institution_match = re.search(r'(?:Dissertation|Ph\.D\.|PhD),\s*(.*?)(?:[.,]|$)', working_paper_text)
+                if 'working paper' in working_paper_text.lower():
+                    # Try different patterns to find institution
+                    patterns = [
+                        r'[Ww]orking [Pp]aper(?:[.,]\s*|\s+)([^,.]+(?:[^,.]|,\s+(?:Series|No))[^,.]*)',
+                        r'[Ww]orking [Pp]aper[.,]?\s*([^,.]+)',
+                        r'[Ww]orking [Pp]aper.*?(?:at|,)\s*([^,.]+)',
+                    ]
+                    for pattern in patterns:
+                        institution_match = re.search(pattern, working_paper_text)
+                        if institution_match:
+                            break
+                elif any(term in working_paper_text.lower() for term in ['dissertation', 'ph.d.', 'phd']):
+                    institution_match = re.search(r'(?:Dissertation|Ph\.D\.|PhD)[.,]?\s*([^,.]+)', working_paper_text)
                 
                 if institution_match:
                     ref.working_paper_institution = self.clean_text(institution_match.group(1))
-                
-                # Use LLM backup if essential fields are missing (including institution)
-                if not ref.title or not ref.year or not ref.working_paper_institution:  # Added institution check
-                    backup_result = await self.llm_backup(ref_elem.get_text(), ref.ref_type)
-                    ref.title = backup_result.get('title') or ref.title
-                    ref.working_paper_institution = backup_result.get('institution') or ref.working_paper_institution
-                    ref.year = backup_result.get('year') or ref.year
             
             # If not a working paper, continue with normal parsing...
             else:
@@ -420,33 +457,35 @@ class ScienceDirectParser(BaseParser):
                     if title_div:
                         ref.title = self.clean_text(title_div.get_text())
                 
-                # Try to parse the host div for journal articles
+                # Parse the host div for journal articles
                 if host_div:
                     host_text = host_div.get_text().strip()
+                    # Try to match the common format: "Journal Name, Volume (Issue) (Year), pp. Pages"
+                    journal_match = re.match(r'([^,]+),\s*(\d+)\s*\((\d+)\)\s*\((\d{4})\),\s*pp\.\s*(\d+)-(\d+)', host_text)
                     
-                    # Check if it's a book
-                    book_indicators = [
-                        '(Eds.)', '(Ed.)', 'Elsevier', 'Press', 'Publisher',
-                        'Amsterdam', 'London', 'New York', 'Boston', 'Oxford',
-                        'Cambridge', 'Chicago', 'MIT'
-                    ]
-                    
-                    if any(indicator in host_text for indicator in book_indicators):
-                        ref.ref_type = ReferenceType.BOOK
-                        backup_result = await self.llm_backup(host_text, ReferenceType.BOOK)
-                        ref.book_title = backup_result.get('book_title')
-                        ref.year = backup_result.get('year')
-                        ref.chapter_title = backup_result.get('chapter_title')
+                    if journal_match:
+                        ref.journal = self.clean_journal(journal_match.group(1))
+                        ref.volume = journal_match.group(2)
+                        ref.year = journal_match.group(4)
+                        ref.page_first = journal_match.group(5)
+                        ref.page_last = journal_match.group(6)
                     else:
-                        ref.ref_type = ReferenceType.ARTICLE
-                        # Try to match standard journal format
-                        standard_journal_match = re.search(r'^([^,]+),\s*(\d+)\s*\((\d{4})\),\s*pp\.\s*(\d+)-(\d+)$', host_text)
-                        if standard_journal_match:
-                            ref.journal = self.clean_journal(standard_journal_match.group(1))
-                            ref.volume = standard_journal_match.group(2)
-                            ref.year = standard_journal_match.group(3)
-                            ref.page_first = standard_journal_match.group(4)
-                            ref.page_last = standard_journal_match.group(5)
+                        # Try simpler pattern without issue number
+                        journal_match = re.match(r'([^,]+),\s*(\d+)\s*\((\d{4})\),\s*pp\.\s*(\d+)-(\d+)', host_text)
+                        if journal_match:
+                            ref.journal = self.clean_journal(journal_match.group(1))
+                            ref.volume = journal_match.group(2)
+                            ref.year = journal_match.group(3)
+                            ref.page_first = journal_match.group(4)
+                            ref.page_last = journal_match.group(5)
+                        else:
+                            # If it doesn't match journal format and isn't a working paper, treat as book
+                            ref.ref_type = ReferenceType.BOOK
+                            ref.book_title = self.clean_text(host_text)
+                            # Try to extract year if present
+                            year_match = re.search(r'\((\d{4})\)', host_text)
+                            if year_match:
+                                ref.year = year_match.group(1)
             
             # Extract DOI if present
             doi_elem = ref_elem.find('a', href=re.compile(r'doi.org'))
@@ -455,16 +494,29 @@ class ScienceDirectParser(BaseParser):
                 if doi_href.startswith('https://doi.org/'):
                     ref.doi = doi_href[len('https://doi.org/'):]
             
-            # Use LLM backup if needed
-            if ref.ref_type == ReferenceType.ARTICLE and (not ref.title or not ref.journal or not ref.year):
-                backup_result = await self.llm_backup(ref_elem.get_text(), ref.ref_type)
-                ref.title = backup_result.get('title') or ref.title
-                ref.journal = backup_result.get('journal') or ref.journal
-                ref.year = backup_result.get('year') or ref.year
-                ref.volume = backup_result.get('volume') or ref.volume
-                ref.page_first = backup_result.get('page_first') or ref.page_first
-                ref.page_last = backup_result.get('page_last') or ref.page_last
-            
+            # Single LLM backup check at the end for all reference types
+            if ref.ref_type == ReferenceType.BOOK:
+                if not ref.book_title or not ref.year:
+                    backup_result = await self.llm_backup(ref_elem.get_text(), ref.ref_type)
+                    ref.book_title = backup_result.get('book_title') or ref.book_title
+                    ref.chapter_title = backup_result.get('chapter_title') or ref.chapter_title
+                    ref.year = backup_result.get('year') or ref.year
+            elif ref.ref_type == ReferenceType.WORKING_PAPER:
+                if not ref.title or not ref.working_paper_institution or not ref.year:
+                    backup_result = await self.llm_backup(ref_elem.get_text(), ref.ref_type)
+                    ref.title = backup_result.get('title') or ref.title
+                    ref.working_paper_institution = backup_result.get('institution') or ref.working_paper_institution
+                    ref.year = backup_result.get('year') or ref.year
+            elif ref.ref_type == ReferenceType.ARTICLE:
+                if not ref.title or not ref.journal or not ref.year:
+                    backup_result = await self.llm_backup(ref_elem.get_text(), ref.ref_type)
+                    ref.title = backup_result.get('title') or ref.title
+                    ref.journal = backup_result.get('journal') or ref.journal
+                    ref.year = backup_result.get('year') or ref.year
+                    ref.volume = backup_result.get('volume') or ref.volume
+                    ref.page_first = backup_result.get('page_first') or ref.page_first
+                    ref.page_last = backup_result.get('page_last') or ref.page_last
+
             return ref
             
         except Exception as e:
@@ -606,28 +658,6 @@ class ScienceDirectParser(BaseParser):
         
         return [a for a in authors if a]
 
-    def format_author_name(self, author: str) -> str:
-        """Format author name, handling cases like "Palepu, K." -> "K. Palepu" """
-        author = self.clean_text(author)
-        if not author:
-            return ""
-        
-        initial_match = re.match(r'([^,]+),\s*([A-Z]\.?)\s*$', author)
-        if initial_match:
-            lastname = initial_match.group(1).strip()
-            initial = initial_match.group(2).strip()
-            if not initial.endswith('.'):
-                initial += '.'
-            return f"{initial} {lastname}"
-        
-        if re.match(r'^[A-Z]\.\s+\w+$', author):
-            return author
-        
-        if re.match(r'^[A-Z][a-z]+$', author):
-            return author
-        
-        return author
-
 class WileyParser(BaseParser):
     def extract_year(self, text: str) -> str:
         """Extract a valid year from text"""
@@ -668,11 +698,15 @@ class WileyParser(BaseParser):
             # Extract authors from class='author'
             author_elems = ref_elem.find_all('span', class_='author')
             authors = []
-            for author in author_elems:
+            for i, author in enumerate(author_elems):
                 author_text = self.clean_text(author.get_text())
                 if author_text and len(author_text) > 2:  # Ignore very short author names
                     author_text = author_text.strip(',')
                     if author_text:
+                        # For first author, rearrange "Last, First" to "First Last"
+                        if i == 0 and ',' in author_text:
+                            last_name, first_name = author_text.split(',', 1)
+                            author_text = f"{first_name.strip()} {last_name.strip()}"
                         authors.append(author_text)
             ref.authors = authors
             
@@ -681,54 +715,83 @@ class WileyParser(BaseParser):
             if year_elem:
                 ref.year = self.extract_year(year_elem.get_text())
             
-            # Determine if it's a working paper
-            full_text = ref_elem.get_text().lower()
-            if any(term in full_text for term in self.working_paper_terms):
+            # Check for book indicators first
+            book_title_elem = ref_elem.find('span', class_='bookTitle')
+            chapter_title_elem = ref_elem.find('span', class_='chapterTitle')
+            
+            if book_title_elem or chapter_title_elem:
+                ref.ref_type = ReferenceType.BOOK
+                if book_title_elem:
+                    ref.book_title = self.clean_text(book_title_elem.get_text())
+                if chapter_title_elem:
+                    ref.chapter_title = self.clean_text(chapter_title_elem.get_text())
+            
+            # If not a book, check if it's a working paper
+            elif any(term in ref_elem.get_text().lower() for term in self.working_paper_terms):
                 ref.ref_type = ReferenceType.WORKING_PAPER
-                # For working papers, title is in bookTitle class
-                title_elem = ref_elem.find('span', class_='bookTitle')
+                # For working papers, title might be in bookTitle class
+                title_elem = book_title_elem or ref_elem.find('span', class_='articleTitle')
                 if title_elem:
                     ref.title = self.clean_text(title_elem.get_text())
                 # Extract institution if available
+                full_text = ref_elem.get_text().lower()
                 after_working = full_text[full_text.find('working paper')+len('working paper'):]
                 institution_match = re.search(r',\s*([^,\.]+)', after_working)
                 if institution_match:
                     ref.working_paper_institution = self.clean_text(institution_match.group(1))
+            
+            # Otherwise, treat as article
             else:
-                # For articles, extract title from articleTitle
+                ref.ref_type = ReferenceType.ARTICLE
+                # Extract title from articleTitle class
                 title_elem = ref_elem.find('span', class_='articleTitle')
                 if title_elem:
                     ref.title = self.clean_text(title_elem.get_text())
                 
-                # Extract journal name from italicized text
-                journal_elem = ref_elem.find('i')
+                # Extract journal name from italicized text or journalTitle class
+                journal_elem = ref_elem.find('i') or ref_elem.find('span', class_='journalTitle')
                 if journal_elem:
-                    ref.journal = self.clean_text(journal_elem.get_text())
+                    ref.journal = self.clean_journal(journal_elem.get_text())
                 
                 # Extract volume and pages
-                vol_elem = ref_elem.find('span', class_='vol')
-                if vol_elem:
-                    ref.volume = vol_elem.get_text().strip()
+                volume_elem = ref_elem.find('span', class_='vol')
+                if volume_elem:
+                    ref.volume = self.clean_volume(volume_elem.get_text())
                 
+                # Extract pages using pageFirst and pageLast spans
                 page_first_elem = ref_elem.find('span', class_='pageFirst')
                 if page_first_elem:
-                    ref.page_first = page_first_elem.get_text().strip()
+                    ref.page_first = self.clean_pages(page_first_elem.get_text())
                 
                 page_last_elem = ref_elem.find('span', class_='pageLast')
                 if page_last_elem:
-                    ref.page_last = page_last_elem.get_text().strip()
+                    ref.page_last = self.clean_pages(page_last_elem.get_text())
+                
+                # Fallback to pages span if pageFirst/pageLast not found
+                if not ref.page_first and not ref.page_last:
+                    pages_elem = ref_elem.find('span', class_='pages')
+                    if pages_elem:
+                        pages_text = pages_elem.get_text()
+                        pages_match = re.search(r'(\d+)[-–](\d+)', pages_text)
+                        if pages_match:
+                            ref.page_first = pages_match.group(1)
+                            ref.page_last = pages_match.group(2)
             
-            # Extract DOI from hidden data-doi span
-            doi_container = ref_elem.find('div', class_='extra-links getFTR')
-            if doi_container:
-                doi_span = doi_container.find('span', class_='hidden data-doi')
-                if doi_span:
-                    doi_text = doi_span.get_text().strip()
-                    if doi_text.startswith('10.'):
-                        ref.doi = doi_text
+            # Extract DOI if present
+            doi_span = ref_elem.find('span', class_='hidden data-doi')
+            if doi_span:
+                doi_text = doi_span.get_text().strip()
+                if doi_text:
+                    ref.doi = doi_text
             
-            # Use LLM backup if essential fields are missing
-            if ref.ref_type == ReferenceType.WORKING_PAPER:
+            # Use LLM backup if essential fields are missing (at the end)
+            if ref.ref_type == ReferenceType.BOOK:
+                if not ref.book_title or not ref.year:
+                    backup_result = await self.llm_backup(ref_elem.get_text(), ref.ref_type)
+                    ref.book_title = backup_result.get('book_title') or ref.book_title
+                    ref.chapter_title = backup_result.get('chapter_title') or ref.chapter_title
+                    ref.year = backup_result.get('year') or ref.year
+            elif ref.ref_type == ReferenceType.WORKING_PAPER:
                 if not ref.title or not ref.working_paper_institution or not ref.year:
                     backup_result = await self.llm_backup(ref_elem.get_text(), ref.ref_type)
                     ref.title = backup_result.get('title') or ref.title
@@ -976,9 +1039,6 @@ class OUPParser(BaseParser):
                         ref.title = backup_result.get('title') or ref.title
                         ref.journal = backup_result.get('journal') or ref.journal
                         ref.year = backup_result.get('year') or ref.year
-                        ref.volume = backup_result.get('volume') or ref.volume
-                        ref.page_first = backup_result.get('page_first') or ref.page_first
-                        ref.page_last = backup_result.get('page_last') or ref.page_last
                 
                 else:
                     # If no article title but has source, treat as book
@@ -1013,6 +1073,29 @@ class OUPParser(BaseParser):
                             doi = doi_href[len('http://dx.doi.org/'):]
             
             ref.doi = doi
+            
+            # Use LLM backup if essential fields are missing (at the end)
+            if ref.ref_type == ReferenceType.BOOK:
+                if not ref.book_title or not ref.year:
+                    backup_result = await self.llm_backup(ref_elem.get_text(), ref.ref_type)
+                    ref.book_title = backup_result.get('book_title') or ref.book_title
+                    ref.chapter_title = backup_result.get('chapter_title') or ref.chapter_title
+                    ref.year = backup_result.get('year') or ref.year
+            elif ref.ref_type == ReferenceType.WORKING_PAPER:
+                if not ref.title or not ref.working_paper_institution or not ref.year:
+                    backup_result = await self.llm_backup(ref_elem.get_text(), ref.ref_type)
+                    ref.title = backup_result.get('title') or ref.title
+                    ref.working_paper_institution = backup_result.get('institution') or ref.working_paper_institution
+                    ref.year = backup_result.get('year') or ref.year
+            elif ref.ref_type == ReferenceType.ARTICLE:
+                if not ref.title or not ref.journal or not ref.year:
+                    backup_result = await self.llm_backup(ref_elem.get_text(), ref.ref_type)
+                    ref.title = backup_result.get('title') or ref.title
+                    ref.journal = backup_result.get('journal') or ref.journal
+                    ref.year = backup_result.get('year') or ref.year
+                    ref.volume = backup_result.get('volume') or ref.volume
+                    ref.page_first = backup_result.get('page_first') or ref.page_first
+                    ref.page_last = backup_result.get('page_last') or ref.page_last
             
             return ref
             
@@ -1113,9 +1196,9 @@ class OUPParser(BaseParser):
             )
 
 if __name__ == "__main__":
-    # Process all JF articles using Wiley parser
+    # Process all files in the JF folder
     html_dir = "downloaded_html/JF"
     output_json = "JF_articles.json"
     output_csv = "JF_articles.csv"
-    print("Processing Journal of Finance articles...")
+    print("Processing all Wiley JF articles...")
     asyncio.run(process_html_files(html_dir, output_json, output_csv, "wiley"))
