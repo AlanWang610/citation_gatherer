@@ -10,7 +10,7 @@ import csv
 from dataclasses import asdict
 from pathlib import Path
 import pandas as pd
-from multiprocessing import Pool
+from multiprocessing import Pool, Value
 from functools import partial
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -216,13 +216,12 @@ class ParserFactory:
         return parser_class()
 
 # Shared processing functions
-async def process_single_file(file_path: str, parser: BaseParser, api_key: str) -> Optional[dict]:
+async def process_single_file(file_path: str, parser: BaseParser, api_key: str, counter: Value) -> Optional[dict]:
     """Process a single HTML file and return its metadata as a dictionary"""
     try:
         # Set the API key in the environment for this process
         os.environ['OPENAI_API_KEY'] = api_key
         
-        print(f"Processing {file_path}...")
         metadata = await parser.parse_html(str(file_path))
         
         article_metadata = {
@@ -252,6 +251,9 @@ async def process_single_file(file_path: str, parser: BaseParser, api_key: str) 
                 } for ref in metadata.references
             ]
         }
+        with counter.get_lock():
+            counter.value += 1
+            print(f"Progress: {counter.value}/{total_files} articles processed")
         print(f"Successfully processed {article_metadata['article.title']}")
         return article_metadata
     except Exception as e:
@@ -267,17 +269,21 @@ async def process_html_files(html_dir: str, output_file_json: str, output_file_c
         raise ValueError("OPENAI_API_KEY not found in environment variables")
 
     html_files = list(Path(html_dir).glob('*.html'))
+    global total_files
     total_files = len(html_files)
     print(f"\nFound {total_files} HTML files to process...")
     
     parser = ParserFactory.get_parser(platform)
     
+    # Create a shared counter for tracking progress
+    counter = Value('i', 0)
+    
     # Process files in parallel using ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=12) as executor:
+    with ProcessPoolExecutor(max_workers=4) as executor:
         # Convert to list of strings for serialization
         file_paths = [str(path) for path in html_files]
-        # Create partial function with parser and api_key
-        process_func = partial(process_single_file, parser=parser, api_key=api_key)
+        # Create partial function with parser, api_key, and counter
+        process_func = partial(process_single_file, parser=parser, api_key=api_key, counter=counter)
         # Process files in parallel
         tasks = [asyncio.create_task(process_func(file_path)) for file_path in file_paths]
         all_metadata = await asyncio.gather(*tasks)
