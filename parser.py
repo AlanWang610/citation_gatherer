@@ -13,7 +13,7 @@ import pandas as pd
 from multiprocessing import Pool, Value
 from functools import partial
 from dotenv import load_dotenv
-from openai import OpenAI
+import openai
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ProcessPoolExecutor
@@ -119,7 +119,7 @@ class BaseParser:
     async def llm_backup(self, text: str, ref_type: ReferenceType) -> dict:
         """Async backup function that uses LLM to parse reference text when regular parsing fails"""
         load_dotenv()
-        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        openai.api_key = os.getenv('OPENAI_API_KEY')
 
         self.llm_call_counter += 1
         
@@ -142,7 +142,7 @@ class BaseParser:
                 with ThreadPoolExecutor() as pool:
                     response = await loop.run_in_executor(
                         pool,
-                        lambda: client.chat.completions.create(
+                        lambda: openai.ChatCompletion.create(
                             model="gpt-4o-mini-2024-07-18",
                             messages=[
                                 {"role": "system", "content": system_prompt},
@@ -254,7 +254,7 @@ async def process_single_file(file_path: str, parser: BaseParser, api_key: str, 
         with counter.get_lock():
             counter.value += 1
             print(f"Progress: {counter.value}/{total_files} articles processed")
-        print(f"Successfully processed {article_metadata['article.title']}")
+        print(f"Successfully processed {article_metadata['article.title']} (API calls: {parser.llm_call_counter})")
         return article_metadata
     except Exception as e:
         print(f"Error processing {file_path}: {e}")
