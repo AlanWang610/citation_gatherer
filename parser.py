@@ -65,7 +65,7 @@ class BaseParser:
             'working paper', 'dissertation', 'research paper',
             'discussion paper', 'brookings paper', 'nber paper',
             'unpublished paper', 'unpublished', 'mimeo',
-            'manuscript', 'work in progress'
+            'manuscript', 'work in progress', 'brookings'
         }
 
     # Shared utility functions
@@ -1016,7 +1016,7 @@ class OUPParser(BaseParser):
                 return ref
             
             ref_id = parent_div.get('data-id', '')
-            is_type_1 = ref_id.startswith('R')
+            is_type_1 = bool(re.match(r'^[A-Z]\d+$', ref_id))
             
             if is_type_1:
                 # Type 1 parsing logic
@@ -1273,12 +1273,12 @@ class OUPParser(BaseParser):
             references = []
             ref_items = soup.find_all('div', {'class': 'js-splitview-ref-item'})
             for ref_item in ref_items:
-                ref_content = ref_item.find('div', {'class': 'mixed-citation'})
+                ref_content = ref_item.find('div', {'class': ['mixed-citation', 'citation element-citation']})
                 if ref_content:
                     ref = await self.parse_reference(ref_content)
             ref_items = soup.find_all('div', {'class': 'js-splitview-ref-item'})
             for ref_item in ref_items:
-                ref_content = ref_item.find('div', {'class': 'mixed-citation'})
+                ref_content = ref_item.find('div', {'class': ['mixed-citation', 'citation element-citation']})
                 if ref_content:
                     ref = await self.parse_reference(ref_content)
                     if ref.authors:  # Only add if we found at least one author
@@ -1317,9 +1317,9 @@ def parse_title_from_citation(citation_text):
     return None
 
 if __name__ == "__main__":
-    # Process all RFS files using OUP parser
-    html_dir = "downloaded_html/RFS"
-    output_json = "RFS_articles.json"
-    output_csv = "RFS_articles.csv"
-    # Run the processing
-    asyncio.run(process_html_files(html_dir, output_json, output_csv, "oup"))
+    # Test a single OUP file
+    # file_path = "downloaded_html\RFS\_rfs_article_16_1_237_1617305.html"
+    # file_path = "downloaded_html\RFS\_rfs_article_19_1_237_1578794.html"
+    file_path = "downloaded_html\RFS_temp\_rfs_article_28_1_176_1682066.html"
+    print(f"Testing OUP parser with file: {file_path}")
+    asyncio.run(test_single_file(file_path, "oup"))
