@@ -18,6 +18,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ProcessPoolExecutor
 from bs4.element import NavigableString, Tag
+from bs4.element import NavigableString, Tag
 
 # Shared enums and dataclasses
 class ReferenceType(Enum):
@@ -1013,10 +1014,29 @@ class OUPParser(BaseParser):
             full_text = ref_elem.get_text()
             
             # Extract authors - handle both formats
+            # Get full text for backup parsing
+            full_text = ref_elem.get_text()
+            
+            # Extract authors - handle both formats
             authors = []
             
             # First try the well-formatted case with name divs
+            
+            # First try the well-formatted case with name divs
             name_divs = ref_elem.find_all('div', class_='name')
+            if name_divs:
+                for name_div in name_divs:
+                    surname = name_div.find('div', class_='surname')
+                    given_names = name_div.find('div', class_='given-names')
+                    
+                    if surname and given_names:
+                        surname_text = self.clean_text(surname.get_text())
+                        given_names_text = self.clean_text(given_names.get_text())
+                        
+                        if surname_text and given_names_text:
+                            full_name = f"{given_names_text} {surname_text}"
+                            if len(full_name.strip()) > 2:
+                                authors.append(full_name)
             if name_divs:
                 for name_div in name_divs:
                     surname = name_div.find('div', class_='surname')
@@ -1258,6 +1278,11 @@ class OUPParser(BaseParser):
                 ref_content = ref_item.find('div', {'class': 'mixed-citation'})
                 if ref_content:
                     ref = await self.parse_reference(ref_content)
+            ref_items = soup.find_all('div', {'class': 'js-splitview-ref-item'})
+            for ref_item in ref_items:
+                ref_content = ref_item.find('div', {'class': 'mixed-citation'})
+                if ref_content:
+                    ref = await self.parse_reference(ref_content)
                     if ref.authors:  # Only add if we found at least one author
                         references.append(ref)
             
@@ -1282,6 +1307,16 @@ class OUPParser(BaseParser):
                 page_last=None, citations=None, doi=None,
                 references=[]
             )
+
+def parse_title_from_citation(citation_text):
+    # Look for text after year that's not in a div
+    year_match = re.search(r'\(\d{4}\)', citation_text)
+    if year_match:
+        post_year = citation_text[year_match.end():].strip()
+        # Remove starting/ending quotes and trailing comma if present
+        title = post_year.strip('"').strip("'").rstrip(',').strip()
+        return title
+    return None
 
 def parse_title_from_citation(citation_text):
     # Look for text after year that's not in a div
