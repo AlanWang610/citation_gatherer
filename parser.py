@@ -1317,8 +1317,9 @@ def parse_title_from_citation(citation_text):
     return None
 
 if __name__ == "__main__":
-    # Test a single OUP file
-    file_path = "downloaded_html\RFS\_rfs_article_16_1_237_1617305.html"
-    # file_path = "downloaded_html\RFS\_rfs_article_19_1_237_1578794.html"
-    print(f"Testing OUP parser with file: {file_path}")
-    asyncio.run(test_single_file(file_path, "oup"))
+    # Process all RFS files using OUP parser
+    html_dir = "downloaded_html/RFS"
+    output_json = "RFS_articles.json"
+    output_csv = "RFS_articles.csv"
+    # Run the processing
+    asyncio.run(process_html_files(html_dir, output_json, output_csv, "oup"))
