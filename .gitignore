@@ -2,6 +2,7 @@
 archive/
 data/
 downloaded_html/
+outputs/
 
 # Python virtual environment
 .venv/
