@@ -17,6 +17,7 @@ import openai
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ProcessPoolExecutor
+from bs4.element import NavigableString, Tag
 
 # Shared enums and dataclasses
 class ReferenceType(Enum):
@@ -1008,21 +1009,56 @@ class OUPParser(BaseParser):
         )
         
         try:
-            # Extract authors from name divs
+            # Get full text for backup parsing
+            full_text = ref_elem.get_text()
+            
+            # Extract authors - handle both formats
             authors = []
+            
+            # First try the well-formatted case with name divs
             name_divs = ref_elem.find_all('div', class_='name')
-            for name_div in name_divs:
-                surname = name_div.find('div', class_='surname')
-                given_names = name_div.find('div', class_='given-names')
-                
-                if surname and given_names:
-                    surname_text = self.clean_text(surname.get_text())
-                    given_names_text = self.clean_text(given_names.get_text())
+            if name_divs:
+                for name_div in name_divs:
+                    surname = name_div.find('div', class_='surname')
+                    given_names = name_div.find('div', class_='given-names')
                     
-                    if surname_text and given_names_text:
-                        full_name = f"{given_names_text} {surname_text}"
-                        if len(full_name.strip()) > 2:
-                            authors.append(full_name)
+                    if surname and given_names:
+                        surname_text = self.clean_text(surname.get_text())
+                        given_names_text = self.clean_text(given_names.get_text())
+                        
+                        if surname_text and given_names_text:
+                            full_name = f"{given_names_text} {surname_text}"
+                            if len(full_name.strip()) > 2:
+                                authors.append(full_name)
+            
+            # If no authors found, try the problematic format
+            if not authors:
+                # Get the first author from direct surname/given-names divs
+                surname_div = ref_elem.find('div', class_='surname')
+                given_names_div = ref_elem.find('div', class_='given-names')
+                
+                if surname_div and given_names_div:
+                    first_author = f"{self.clean_text(given_names_div.get_text())} {self.clean_text(surname_div.get_text())}"
+                    authors.append(first_author)
+                    
+                    # Get remaining authors from text between given-names and year
+                    if given_names_div and ref_elem.find('div', class_='year'):
+                        text_after_first = ''
+                        current = given_names_div.next_sibling
+                        while current and not (isinstance(current, Tag) and 'year' in current.get('class', [])):
+                            if isinstance(current, NavigableString):
+                                text_after_first += str(current)
+                            current = current.next_sibling
+                        
+                        # Extract additional authors
+                        other_authors = text_after_first.split(',')
+                        for author in other_authors[1:]:  # Skip first split as it's empty
+                            author = self.clean_text(author)
+                            if author and author.strip() not in ['and', '&']:
+                                # Remove common conjunctions
+                                author = re.sub(r'\s+(?:and|&)\s+', '', author)
+                                if author.strip():
+                                    authors.append(author.strip())
             
             ref.authors = authors
             
@@ -1031,65 +1067,54 @@ class OUPParser(BaseParser):
             if year_elem:
                 ref.year = year_elem.get_text().strip()
             
-            # Check if it's a working paper
-            comment_elem = ref_elem.find('div', class_='comment')
-            if comment_elem and any(term in comment_elem.get_text().lower() for term in self.working_paper_terms):
-                ref.ref_type = ReferenceType.WORKING_PAPER
-                # Get title from source for working papers
-                source_elem = ref_elem.find('div', class_='source')
-                if source_elem:
-                    ref.title = self.clean_text(source_elem.get_text())
-                # Get institution
-                publisher_elem = ref_elem.find('div', class_='publisher-name')
-                if publisher_elem:
-                    ref.working_paper_institution = self.clean_text(publisher_elem.get_text())
-                
-                # Use LLM backup if essential fields are missing
-                if not ref.title or not ref.working_paper_institution or not ref.year:
-                    backup_result = await self.llm_backup(ref_elem.get_text(), ReferenceType.WORKING_PAPER)
-                    ref.title = backup_result.get('title') or ref.title
-                    ref.working_paper_institution = backup_result.get('institution') or ref.working_paper_institution
-                    ref.year = backup_result.get('year') or ref.year
-            
-            else:
-                # Check for article elements
-                article_title = ref_elem.find('div', class_='article-title')
-                source = ref_elem.find('div', class_='source')
-                volume = ref_elem.find('div', class_='volume')
-                fpage = ref_elem.find('div', class_='fpage')
-                lpage = ref_elem.find('div', class_='lpage')
-                
-                if article_title and source:
-                    ref.ref_type = ReferenceType.ARTICLE
-                    ref.title = self.clean_text(article_title.get_text())
-                    ref.journal = self.clean_text(source.get_text())
-                    if volume:
-                        ref.volume = volume.get_text().strip()
-                    if fpage:
-                        ref.page_first = fpage.get_text().strip()
-                    if lpage:
-                        ref.page_last = lpage.get_text().strip()
+            # Extract title - look for text between year and source
+            if year_elem:
+                title_text = year_elem.next_sibling
+                if title_text:
+                    title = str(title_text)[1:-2]
+                    ref.title = self.clean_text(title)
                     
-                    # Use LLM backup if essential fields are missing
-                    if not ref.title or not ref.journal or not ref.year:
-                        backup_result = await self.llm_backup(ref_elem.get_text(), ref.ref_type)
-                        ref.title = backup_result.get('title') or ref.title
-                        ref.journal = backup_result.get('journal') or ref.journal
-                        ref.year = backup_result.get('year') or ref.year
-                
-                else:
-                    # If no article title but has source, treat as book
-                    ref.ref_type = ReferenceType.BOOK
-                    if source:
-                        ref.book_title = self.clean_text(source.get_text())
-                    
-                    # Use LLM backup if essential fields are missing
-                    if not ref.book_title or not ref.year:
-                        backup_result = await self.llm_backup(ref_elem.get_text(), ReferenceType.BOOK)
-                        ref.book_title = backup_result.get('book_title') or ref.book_title
-                        ref.chapter_title = backup_result.get('chapter_title')
-                        ref.year = backup_result.get('year') or ref.year
+                    # Check if title contains working paper terms and reclassify if needed
+                    if ref.title and any(term in ref.title.lower() for term in self.working_paper_terms):
+                        ref.ref_type = ReferenceType.WORKING_PAPER
+                        # Try to extract institution from the title or source
+                        source_elem = ref_elem.find('div', class_='source')
+                        if source_elem:
+                            source_text = source_elem.get_text()
+                            after_wp = source_text[source_text.lower().find('working paper')+len('working paper'):].strip()
+                            institution_match = re.search(r',\s*([^,\.]+)', after_wp)
+                            if institution_match:
+                                ref.working_paper_institution = self.clean_text(institution_match.group(1))
             
+            # Extract source (journal)
+            source_elem = ref_elem.find('div', class_='source')
+            if source_elem:
+                ref.journal = self.clean_journal(source_elem.get_text())
+            
+            # Extract volume
+            volume_elem = ref_elem.find('div', class_='volume')
+            if volume_elem:
+                ref.volume = volume_elem.get_text().strip()
+            
+            # Extract pages
+            fpage = ref_elem.find('div', class_='fpage')
+            if fpage:
+                ref.page_first = fpage.get_text().strip()
+                
+                # Look for last page in text after fpage
+                if ref.page_first:
+                    text_after_fpage = ''
+                    current = fpage.next_sibling
+                    while current:
+                        if isinstance(current, NavigableString):
+                            text_after_fpage += str(current)
+                        current = current.next_sibling
+                    
+                    # Extract last page
+                    last_page_match = re.search(r'[-–](\d+)', text_after_fpage)
+                    if last_page_match:
+                        ref.page_last = last_page_match.group(1)
+
             # Extract DOI if present
             doi = None
             # First check direct doi.org links
@@ -1202,11 +1227,11 @@ class OUPParser(BaseParser):
             
             # Extract references
             references = []
-            ref_list = soup.find('div', class_='ref-list')
-            if ref_list:
-                ref_items = ref_list.find_all('div', class_='ref-content')
-                for ref_item in ref_items:
-                    ref = await self.parse_reference(ref_item)
+            ref_items = soup.find_all('div', {'class': 'js-splitview-ref-item'})
+            for ref_item in ref_items:
+                ref_content = ref_item.find('div', {'class': 'mixed-citation'})
+                if ref_content:
+                    ref = await self.parse_reference(ref_content)
                     if ref.authors:  # Only add if we found at least one author
                         references.append(ref)
             
@@ -1232,10 +1257,18 @@ class OUPParser(BaseParser):
                 references=[]
             )
 
+def parse_title_from_citation(citation_text):
+    # Look for text after year that's not in a div
+    year_match = re.search(r'\(\d{4}\)', citation_text)
+    if year_match:
+        post_year = citation_text[year_match.end():].strip()
+        # Remove starting/ending quotes and trailing comma if present
+        title = post_year.strip('"').strip("'").rstrip(',').strip()
+        return title
+    return None
+
 if __name__ == "__main__":
-    # Process all files in the JFE folder
-    html_dir = "downloaded_html/JFE"
-    output_json = "JFE_articles.json"
-    output_csv = "JFE_articles.csv"
-    print("Processing all ScienceDirect JFE articles...")
-    asyncio.run(process_html_files(html_dir, output_json, output_csv, "ScienceDirect"))
+    # Test a single OUP file
+    file_path = "downloaded_html\RFS\_rfs_article_19_1_237_1578794.html"
+    print(f"Testing OUP parser with file: {file_path}")
+    asyncio.run(test_single_file(file_path, "oup"))
