@@ -1233,6 +1233,13 @@ class OUPParser(BaseParser):
                         if name:
                             authors.append(name)
             
+            # Initialize variables that might be found in citation
+            volume = None
+            issue = None
+            page_first = None
+            page_last = None
+            doi = None
+            
             # Extract citation information (journal, volume, issue, date, pages, doi)
             citation_elem = soup.find('div', class_='ww-citation-primary')
             if citation_elem:
