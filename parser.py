@@ -63,9 +63,9 @@ class BaseParser:
         self.llm_call_counter = 0
         self.working_paper_terms = {
             'working paper', 'dissertation', 'research paper',
-            'discussion paper', 'brookings paper', 'nber paper',
+            'discussion paper', 'nber paper',
             'unpublished paper', 'unpublished', 'mimeo',
-            'manuscript', 'work in progress', 'brookings'
+            'manuscript', 'work in progress'
         }
 
     # Shared utility functions
