@@ -5,6 +5,10 @@ import dotenv
 import openai
 import os
 import json
+import pandas as pd
+import requests_cache
+from pathlib import Path
+
 dotenv.load_dotenv()
 openai_api_key = os.getenv('OPENAI_API_KEY')
 
@@ -23,6 +27,22 @@ working_paper_terms = {
     'manuscript', 'work in progress'
 }
 
+# Initialize cache for API calls
+requests_cache.install_cache('crossref_cache', backend='sqlite', expire_after=604800)  # Cache for 1 week
+
+def load_processed_dois():
+    """Load already processed DOIs from tracking file"""
+    processed_file = Path('processed_dois.txt')
+    if processed_file.exists():
+        with open(processed_file, 'r') as f:
+            return set(line.strip() for line in f)
+    return set()
+
+def save_processed_doi(doi):
+    """Save a DOI to the tracking file"""
+    with open('processed_dois.txt', 'a') as f:
+        f.write(f"{doi}\n")
+
 def fetch_complete_article_data(doi):
     result = cr.works(ids=doi)
     message = result['message']
@@ -33,17 +53,17 @@ def fetch_complete_article_data(doi):
         family = author['family']
         parsed_authors.append([given, family])
     authors = parsed_authors
+    
     references = message['reference']
     # Verify reference count matches
-    ref_count = message['reference-count']
-    if references and len(references) != ref_count:
-        print(f"Warning: Reference count mismatch for DOI {doi}")
-        print(f"Expected {ref_count} references but found {len(references)}")
+    total_ref_count = message['reference-count']
     parsed_references = []
+    skipped_references = 0
+    
     for i, ref in enumerate(references):
         time.sleep(0.02)
         if 'DOI' in ref:
-            parsed_ref = fetch_reference_article_data(ref['DOI'])
+            parsed_ref = fetch_reference_article_data_by_doi(ref['DOI'])
             parsed_references.append(parsed_ref)
         elif 'journal-title' in ref:
             ref_data = {k:v for k,v in ref.items() if k != 'key'}
@@ -51,8 +71,15 @@ def fetch_complete_article_data(doi):
             parsed_references.append(ref_data)
         elif 'unstructured' in ref:
             parsed_ref = fetch_llm_backup(ref['unstructured'], openai_api_key)
-            parsed_references.append(parsed_ref)        
-    references = parsed_references
+            parsed_references.append(parsed_ref)
+        else:
+            skipped_references += 1
+            print(f"Warning: Reference {i+1} could not be parsed - no DOI, journal-title, or unstructured field")
+    
+    if len(references) != total_ref_count:
+        print(f"Warning: Reference count mismatch for DOI {doi}")
+        print(f"Expected {total_ref_count} references but found {len(references)}")
+    
     return {
         'doi': message['DOI'],
         'type': message['type'],
@@ -61,10 +88,15 @@ def fetch_complete_article_data(doi):
         'volume': message['volume'],
         'issue': message['journal-issue']['issue'],
         'authors': authors,
-        'references': references
+        'references': parsed_references,
+        'reference_stats': {
+            'total_references': total_ref_count,
+            'parsed_references': len(parsed_references),
+            'skipped_references': skipped_references
+        }
     }
 
-def fetch_reference_article_data(doi):
+def fetch_reference_article_data_by_doi(doi):
     try:
         result = cr.works(ids=doi)
         message = result['message']
@@ -187,5 +219,45 @@ Return ONLY a valid JSON object with this exact schema, no other text:
             'chapter_title': None
         }
 
-with open('temp.json', 'w') as f:
-    json.dump(fetch_complete_article_data('10.1093/rfs/15.1.1'), f, indent=4)
+def process_dois_from_csv():
+    # Read DOIs from CSV
+    df = pd.read_csv('RFS_dois.csv')
+    dois = df['DOI'].tolist()
+    
+    # Load already processed DOIs
+    processed_dois = load_processed_dois()
+    
+    # Create or load existing output file
+    output_file = Path('articles_data.json')
+    if output_file.exists():
+        with open(output_file, 'r') as f:
+            articles_data = json.load(f)
+    else:
+        articles_data = []
+    
+    # Process each DOI
+    total_dois = len(dois)
+    for i, doi in enumerate(dois):
+        if doi in processed_dois:
+            print(f"Skipping already processed DOI ({i+1}/{total_dois}): {doi}")
+            continue
+            
+        try:
+            print(f"Processing DOI ({i+1}/{total_dois}): {doi}")
+            article_data = fetch_complete_article_data(doi)
+            articles_data.append(article_data)
+            
+            # Save progress after each successful fetch
+            with open(output_file, 'w') as f:
+                json.dump(articles_data, f, indent=4)
+            
+            # Mark DOI as processed
+            save_processed_doi(doi)
+            
+        except Exception as e:
+            print(f"Error processing DOI {doi}: {str(e)}")
+            continue
+
+if __name__ == "__main__":
+    process_dois_from_csv()
+    
