@@ -69,6 +69,10 @@ def fetch_complete_article_data(doi):
             ref_data = {k:v for k,v in ref.items() if k != 'key'}
             ref_data['reference_type'] = 'article'
             parsed_references.append(ref_data)
+        elif 'article-title' in ref:
+            ref_data = {k:v for k,v in ref.items() if k != 'key'}
+            ref_data['reference_type'] = 'article'
+            parsed_references.append(ref_data)
         elif 'unstructured' in ref:
             parsed_ref = fetch_llm_backup(ref['unstructured'], openai_api_key)
             parsed_references.append(parsed_ref)
