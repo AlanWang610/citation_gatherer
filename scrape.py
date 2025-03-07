@@ -46,17 +46,29 @@ def save_processed_doi(doi):
 def fetch_complete_article_data(doi):
     result = cr.works(ids=doi)
     message = result['message']
-    authors = message['author']
-    parsed_authors = []
-    for author in authors:
-        given = author['given']
-        family = author['family']
-        parsed_authors.append([given, family])
-    authors = parsed_authors
     
-    references = message['reference']
-    # Verify reference count matches
-    total_ref_count = message['reference-count']
+    # Parse authors with error handling
+    authors = []
+    if 'author' in message:
+        for author in message.get('author', []):
+            given = author.get('given', '')
+            family = author.get('family', '')
+            authors.append([given, family])
+    
+    # Get publication date, trying different date fields
+    published_date = None
+    if 'published-print' in message and 'date-parts' in message['published-print']:
+        date_parts = message['published-print']['date-parts'][0]
+        if len(date_parts) >= 2:
+            published_date = f"{date_parts[0]}-{date_parts[1]:02d}-01"
+    if not published_date and 'published-online' in message and 'date-parts' in message['published-online']:
+        date_parts = message['published-online']['date-parts'][0]
+        if len(date_parts) >= 2:
+            published_date = f"{date_parts[0]}-{date_parts[1]:02d}-01"
+    
+    # Process references with error handling
+    references = message.get('reference', [])
+    total_ref_count = message.get('reference-count', 0)
     parsed_references = []
     skipped_references = 0
     
@@ -85,12 +97,12 @@ def fetch_complete_article_data(doi):
         print(f"Expected {total_ref_count} references but found {len(references)}")
     
     return {
-        'doi': message['DOI'],
-        'type': message['type'],
-        'published_date': f"{message['published-print']['date-parts'][0][0]}-{message['published-print']['date-parts'][0][1]:02d}-01",
-        'title': message['title'][0],
-        'volume': message['volume'],
-        'issue': message['journal-issue']['issue'],
+        'doi': message.get('DOI'),
+        'type': message.get('type'),
+        'published_date': published_date,
+        'title': message.get('title', [None])[0],
+        'volume': message.get('volume'),
+        'issue': message.get('journal-issue', {}).get('issue'),
         'authors': authors,
         'references': parsed_references,
         'reference_stats': {
@@ -223,7 +235,25 @@ Return ONLY a valid JSON object with this exact schema, no other text:
             'chapter_title': None
         }
 
+def initialize_files():
+    """Initialize necessary files if they don't exist"""
+    # Initialize processed_dois.txt
+    processed_file = Path('processed_dois.txt')
+    if not processed_file.exists():
+        processed_file.touch()
+        print("Created processed_dois.txt")
+
+    # Initialize articles_data.json
+    output_file = Path('articles_data.json')
+    if not output_file.exists():
+        with open(output_file, 'w') as f:
+            json.dump([], f)
+        print("Created articles_data.json")
+
 def process_dois_from_csv():
+    # Initialize files
+    initialize_files()
+    
     # Read DOIs from CSV
     df = pd.read_csv('RFS_dois.csv')
     dois = df['DOI'].tolist()
@@ -233,10 +263,11 @@ def process_dois_from_csv():
     
     # Create or load existing output file
     output_file = Path('articles_data.json')
-    if output_file.exists():
+    try:
         with open(output_file, 'r') as f:
             articles_data = json.load(f)
-    else:
+    except (json.JSONDecodeError, FileNotFoundError):
+        print("Warning: Could not load existing articles_data.json, starting fresh")
         articles_data = []
     
     # Process each DOI
@@ -252,11 +283,14 @@ def process_dois_from_csv():
             articles_data.append(article_data)
             
             # Save progress after each successful fetch
-            with open(output_file, 'w') as f:
-                json.dump(articles_data, f, indent=4)
-            
-            # Mark DOI as processed
-            save_processed_doi(doi)
+            try:
+                with open(output_file, 'w') as f:
+                    json.dump(articles_data, f, indent=4)
+                # Only mark as processed if save was successful
+                save_processed_doi(doi)
+            except Exception as e:
+                print(f"Error saving data for DOI {doi}: {str(e)}")
+                continue
             
         except Exception as e:
             print(f"Error processing DOI {doi}: {str(e)}")
