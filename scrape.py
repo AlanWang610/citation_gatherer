@@ -8,9 +8,8 @@ import json
 import pandas as pd
 import requests_cache
 from pathlib import Path
-import concurrent.futures
 import threading
-from queue import Queue
+from concurrent.futures import ThreadPoolExecutor
 
 dotenv.load_dotenv()
 openai_api_key = os.getenv('OPENAI_API_KEY')
@@ -33,11 +32,22 @@ working_paper_terms = {
 # Initialize cache for API calls
 requests_cache.install_cache('crossref_cache', backend='sqlite', expire_after=604800)  # Cache for 1 week
 
-# Add a thread-safe queue for saving results
-save_queue = Queue()
+class RateLimiter:
+    def __init__(self, calls_per_second):
+        self.delay = 1.0 / calls_per_second
+        self.last_call = time.time()
+        self.lock = threading.Lock()
+    
+    def wait(self):
+        with self.lock:
+            current_time = time.time()
+            time_to_wait = self.last_call + self.delay - current_time
+            if time_to_wait > 0:
+                time.sleep(time_to_wait)
+            self.last_call = time.time()
 
-# Add thread-safe lock for file operations
-file_lock = threading.Lock()
+# Create a global rate limiter (50 calls per second as per Crossref's guidelines)
+rate_limiter = RateLimiter(calls_per_second=2)  # Conservative rate limit
 
 def load_processed_dois():
     """Load already processed DOIs from tracking file"""
@@ -53,6 +63,7 @@ def save_processed_doi(doi):
         f.write(f"{doi}\n")
 
 def fetch_complete_article_data(doi):
+    rate_limiter.wait()  # Wait before making API call
     result = cr.works(ids=doi)
     message = result['message']
     
@@ -123,6 +134,7 @@ def fetch_complete_article_data(doi):
 
 def fetch_reference_article_data_by_doi(doi):
     try:
+        rate_limiter.wait()  # Wait before making API call
         result = cr.works(ids=doi)
         message = result['message']
         
@@ -259,48 +271,15 @@ def initialize_files():
             json.dump([], f)
         print("Created articles_data.json")
 
-def save_worker():
-    """Worker thread to handle saving results to file"""
-    output_file = Path('articles_data.json')
-    while True:
-        item = save_queue.get()
-        if item is None:  # Poison pill to stop the worker
-            break
-            
-        doi, article_data = item
-        try:
-            with file_lock:
-                # Load current data
-                try:
-                    with open(output_file, 'r') as f:
-                        articles_data = json.load(f)
-                except (json.JSONDecodeError, FileNotFoundError):
-                    articles_data = []
-                
-                # Append new data and save
-                articles_data.append(article_data)
-                with open(output_file, 'w') as f:
-                    json.dump(articles_data, f, indent=4)
-                
-                # Mark as processed
-                save_processed_doi(doi)
-                
-            print(f"Saved data for DOI: {doi}")
-        except Exception as e:
-            print(f"Error saving data for DOI {doi}: {str(e)}")
-        
-        save_queue.task_done()
-
-def process_doi(doi, total_dois, current_position):
-    """Process a single DOI with position tracking"""
+def process_single_doi(args):
+    doi, total_dois, current_position = args
     try:
         print(f"Processing DOI ({current_position}/{total_dois}): {doi}")
         article_data = fetch_complete_article_data(doi)
-        save_queue.put((doi, article_data))
-        return True
+        return doi, article_data, None  # None means no error
     except Exception as e:
         print(f"Error processing DOI {doi}: {str(e)}")
-        return False
+        return doi, None, str(e)  # Return the error message
 
 def process_dois_from_csv():
     # Initialize files
@@ -317,37 +296,36 @@ def process_dois_from_csv():
     dois_to_process = [doi for doi in dois if doi not in processed_dois]
     total_dois = len(dois)
     
-    # Start the save worker thread
-    save_thread = threading.Thread(target=save_worker, daemon=True)
-    save_thread.start()
+    # Create or load existing output file
+    output_file = Path('articles_data.json')
+    try:
+        with open(output_file, 'r') as f:
+            articles_data = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        print("Warning: Could not load existing articles_data.json, starting fresh")
+        articles_data = []
     
-    # Process DOIs with thread pool
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        # Submit all DOIs for processing
-        future_to_doi = {
-            executor.submit(
-                process_doi, 
-                doi, 
-                total_dois, 
-                i + 1
-            ): doi 
-            for i, doi in enumerate(dois_to_process)
-        }
+    # Prepare arguments for worker function
+    worker_args = [(doi, total_dois, i+1) for i, doi in enumerate(dois_to_process)]
+    
+    # Process DOIs using thread pool
+    results_lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = list(executor.map(process_single_doi, worker_args))
         
-        # Wait for all tasks to complete
-        for future in concurrent.futures.as_completed(future_to_doi):
-            doi = future_to_doi[future]
-            try:
-                success = future.result()
-                if success:
-                    print(f"Completed processing DOI: {doi}")
-            except Exception as e:
-                print(f"Exception processing DOI {doi}: {str(e)}")
-    
-    # Signal save worker to stop and wait for completion
-    save_queue.put(None)
-    save_thread.join()
-    save_queue.join()
+        # Process results as they complete
+        for doi, article_data, error in futures:
+            if error is None and article_data is not None:
+                with results_lock:
+                    # Save to articles_data
+                    articles_data.append(article_data)
+                    # Save progress after each successful fetch
+                    try:
+                        with open(output_file, 'w') as f:
+                            json.dump(articles_data, f, indent=4)
+                        save_processed_doi(doi)
+                    except Exception as e:
+                        print(f"Error saving data for DOI {doi}: {str(e)}")
 
 if __name__ == "__main__":
     process_dois_from_csv()
