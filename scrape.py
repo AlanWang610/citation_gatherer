@@ -10,6 +10,7 @@ import requests_cache
 from pathlib import Path
 import threading
 from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
 
 dotenv.load_dotenv()
 openai_api_key = os.getenv('OPENAI_API_KEY')
@@ -46,8 +47,8 @@ class RateLimiter:
                 time.sleep(time_to_wait)
             self.last_call = time.time()
 
-# Create a global rate limiter (50 calls per second as per Crossref's guidelines)
-rate_limiter = RateLimiter(calls_per_second=2)  # Conservative rate limit
+# Adjust the rate limiter to be less conservative (50 requests per second instead of 2)
+rate_limiter = RateLimiter(calls_per_second=25)  # Half of the 50 req/s limit to be safe
 
 def load_processed_dois():
     """Load already processed DOIs from tracking file"""
@@ -64,7 +65,8 @@ def save_processed_doi(doi):
 
 def fetch_complete_article_data(doi):
     rate_limiter.wait()  # Wait before making API call
-    result = cr.works(ids=doi)
+    # Add follow parameter to handle redirects
+    result = cr.works(ids=doi, follow=True)
     message = result['message']
     
     # Parse authors with error handling
@@ -135,8 +137,26 @@ def fetch_complete_article_data(doi):
 def fetch_reference_article_data_by_doi(doi):
     try:
         rate_limiter.wait()  # Wait before making API call
-        result = cr.works(ids=doi)
-        message = result['message']
+        # First try with follow=True
+        result = cr.works(ids=doi, follow=True)
+        
+        # If we get a redirect response, try to get the new DOI from the Location header
+        if isinstance(result, dict) and result.get('status') == 'ok':
+            message = result['message']
+        else:
+            # Get the redirect URL from the Crossref client's last response
+            redirect_url = cr._session.last_response.headers.get('Location')
+            if redirect_url:
+                # Extract new DOI from redirect URL if possible
+                new_doi = redirect_url.split('works/')[-1] if 'works/' in redirect_url else None
+                if new_doi:
+                    rate_limiter.wait()  # Wait before making new API call
+                    result = cr.works(ids=new_doi, follow=True)
+                    message = result['message']
+                else:
+                    raise Exception(f"Could not extract DOI from redirect URL: {redirect_url}")
+            else:
+                raise Exception("No redirect URL found in response headers")
         
         # Parse authors
         authors = []
@@ -256,6 +276,22 @@ Return ONLY a valid JSON object with this exact schema, no other text:
             'chapter_title': None
         }
 
+def safe_jsonl_append(data, filepath):
+    """Safely append a single JSON object as a new line"""
+    try:
+        # Convert the data to a JSON string and add a newline
+        json_str = json.dumps(data) + '\n'
+        
+        # Append to the file
+        with open(filepath, 'a', buffering=1) as f:
+            f.write(json_str)
+            f.flush()
+            os.fsync(f.fileno())
+            
+    except Exception as e:
+        print(f"Error appending to JSONL: {str(e)}")
+        raise e
+
 def initialize_files():
     """Initialize necessary files if they don't exist"""
     # Initialize processed_dois.txt
@@ -264,12 +300,11 @@ def initialize_files():
         processed_file.touch()
         print("Created processed_dois.txt")
 
-    # Initialize articles_data.json
-    output_file = Path('articles_data.json')
+    # Initialize articles_data.jsonl instead of .json
+    output_file = Path('articles_data.jsonl')
     if not output_file.exists():
-        with open(output_file, 'w') as f:
-            json.dump([], f)
-        print("Created articles_data.json")
+        output_file.touch()
+        print("Created articles_data.jsonl")
 
 def process_single_doi(args):
     doi, total_dois, current_position = args
@@ -288,44 +323,76 @@ def process_dois_from_csv():
     # Read DOIs from CSV
     df = pd.read_csv('RFS_dois.csv')
     dois = df['DOI'].tolist()
+    del df  # Clear DataFrame from memory
     
     # Load already processed DOIs
     processed_dois = load_processed_dois()
     
     # Filter out already processed DOIs
     dois_to_process = [doi for doi in dois if doi not in processed_dois]
-    total_dois = len(dois)
+    total_to_process = len(dois_to_process)
     
-    # Create or load existing output file
-    output_file = Path('articles_data.json')
-    try:
-        with open(output_file, 'r') as f:
-            articles_data = json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        print("Warning: Could not load existing articles_data.json, starting fresh")
-        articles_data = []
+    print(f"Found {len(dois)} total DOIs")
+    print(f"Already processed {len(processed_dois)} DOIs")
+    print(f"Remaining DOIs to process: {total_to_process}")
     
-    # Prepare arguments for worker function
-    worker_args = [(doi, total_dois, i+1) for i, doi in enumerate(dois_to_process)]
-    
-    # Process DOIs using thread pool
-    results_lock = threading.Lock()
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = list(executor.map(process_single_doi, worker_args))
+    # Process DOIs in batches of 50
+    batch_size = 50
+    for batch_start in range(0, len(dois_to_process), batch_size):
+        batch_end = min(batch_start + batch_size, len(dois_to_process))
+        current_batch = dois_to_process[batch_start:batch_end]
         
-        # Process results as they complete
-        for doi, article_data, error in futures:
-            if error is None and article_data is not None:
-                with results_lock:
-                    # Save to articles_data
-                    articles_data.append(article_data)
-                    # Save progress after each successful fetch
-                    try:
-                        with open(output_file, 'w') as f:
-                            json.dump(articles_data, f, indent=4)
-                        save_processed_doi(doi)
-                    except Exception as e:
-                        print(f"Error saving data for DOI {doi}: {str(e)}")
+        # Load only the most recent batch of data
+        output_file = Path('articles_data.jsonl')
+        articles_data = []  # Start fresh for each batch
+        
+        # Prepare arguments for worker function
+        worker_args = [(doi, total_to_process, i+batch_start+1) 
+                      for i, doi in enumerate(current_batch)]
+        
+        # Process current batch using thread pool
+        results_lock = threading.Lock()
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(process_single_doi, args) for args in worker_args]
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    doi, article_data, error = future.result()
+                    if error is None and article_data is not None:
+                        with results_lock:
+                            try:
+                                # Directly append the new data
+                                safe_jsonl_append(article_data, output_file)
+                                
+                                # Mark DOI as processed
+                                with open('processed_dois.txt', 'a', buffering=1) as f:
+                                    f.write(f"{doi}\n")
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                                
+                                print(f"Successfully processed and saved DOI: {doi}")
+                            except Exception as e:
+                                print(f"Error saving data for DOI {doi}: {str(e)}")
+                                with open('error_log.txt', 'a') as f:
+                                    f.write(f"Error with DOI {doi} at {datetime.now()}: {str(e)}\n")
+                except Exception as e:
+                    print(f"Error processing future: {str(e)}")
+        
+        # Clear memory after each batch
+        articles_data = None
+        print(f"Completed batch {batch_start//batch_size + 1}, cleared memory")
+
+def read_jsonl(filepath):
+    data = []
+    with open(filepath, 'r') as f:
+        for line in f:
+            try:
+                data.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                print(f"Error reading line: {e}")
+                continue
+    return data
 
 if __name__ == "__main__":
     process_dois_from_csv()
