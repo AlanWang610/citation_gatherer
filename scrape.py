@@ -5,6 +5,7 @@ import dotenv
 import openai
 import os
 import json
+import sys
 import pandas as pd
 import requests_cache
 from pathlib import Path
@@ -332,12 +333,12 @@ def process_single_doi(args):
         print(f"Error processing DOI {doi}: {str(e)}")
         return doi, None, str(e)  # Return the error message
 
-def process_dois_from_csv():
+def process_dois_from_csv(doi_file):
     # Initialize files
     initialize_files()
     
     # Read DOIs from CSV
-    df = pd.read_csv('RFS_dois.csv')
+    df = pd.read_csv(doi_file)
     dois = df['DOI'].tolist()
     del df  # Clear DataFrame from memory
     
@@ -411,5 +412,14 @@ def read_jsonl(filepath):
     return data
 
 if __name__ == "__main__":
-    process_dois_from_csv()
+    # Get input file from command line argument
+    if len(sys.argv) != 2:
+        print("Usage: python scrape.py <doi_csv_file>")
+        sys.exit(1)
+    
+    doi_file = sys.argv[1]
+    if not os.path.exists(doi_file):
+        print(f"Error: File {doi_file} not found")
+        sys.exit(1)
+    process_dois_from_csv(doi_file)
     

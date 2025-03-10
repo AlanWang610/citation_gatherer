@@ -8,7 +8,7 @@ import pandas as pd
 cr = Crossref(mailto="wangac@mit.edu")
 
 # Define search parameters
-issn = "1465-7368"  # ISSN for The Review of Financial Studies
+issn = "0022-3808"  # ISSN for The Review of Financial Studies
 start_date = datetime(2000, 1, 1)
 end_date = datetime(2025, 3, 1)
 
@@ -78,9 +78,9 @@ unique_articles.sort(key=lambda x: x[0])
 
 # Save to CSV
 df = pd.DataFrame(unique_articles, columns=['DOI', 'Title', 'Published Date'])
-df.to_csv('RFS_dois.csv', index=False)
+df.to_csv('JPE_dois.csv', index=False)
 
 # Print summary
 print(f"\nCollection complete!")
 print(f"Total unique articles found: {len(unique_articles)}")
-print(f"Results saved to RFS_dois.csv")
+print(f"Results saved to JPE_dois.csv")
