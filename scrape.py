@@ -118,11 +118,17 @@ def fetch_complete_article_data(doi):
         print(f"Warning: Reference count mismatch for DOI {doi}")
         print(f"Expected {total_ref_count} references but found {len(references)}")
     
+    # Get journal name safely
+    journal = None
+    if message.get('container-title') and len(message['container-title']) > 0:
+        journal = message['container-title'][0]
+    
     return {
         'doi': message.get('DOI'),
         'type': message.get('type'),
         'published_date': published_date,
         'title': message.get('title', [None])[0],
+        'journal': journal,  # Use safer journal extraction
         'volume': message.get('volume'),
         'issue': message.get('journal-issue', {}).get('issue'),
         'authors': authors,
@@ -176,11 +182,17 @@ def fetch_reference_article_data_by_doi(doi):
         if 'journal-issue' in message and 'issue' in message['journal-issue']:
             issue = message['journal-issue']['issue']
 
+        # Get journal name safely
+        journal = None
+        if message.get('container-title') and len(message['container-title']) > 0:
+            journal = message['container-title'][0]
+
         return {
             'reference_type': reference_type_map.get(message.get('type')),
             'doi': message.get('DOI'),
             'year': year,
             'title': message['title'][0] if message.get('title') else None,
+            'journal': journal,  # Use safer journal extraction
             'volume': message.get('volume'),
             'issue': issue,
             'authors': authors,
@@ -195,6 +207,7 @@ def fetch_reference_article_data_by_doi(doi):
             'type': None,
             'year': None,
             'title': None,
+            'journal': None,
             'volume': None,
             'issue': None,
             'authors': [],
@@ -223,6 +236,7 @@ Return ONLY a valid JSON object with this exact schema, no other text:
     "doi": null,
     "year": 2024,
     "title": "title of the work",
+    "journal": "name of the journal if article",
     "volume": "volume number if article",
     "issue": "issue number if article",
     "authors": [["first1", "last1"], ["first2", "last2"]],
@@ -251,6 +265,7 @@ Return ONLY a valid JSON object with this exact schema, no other text:
             'doi': None,  # Citations typically don't include DOIs
             'year': parsed_data.get('year'),
             'title': parsed_data.get('title'),
+            'journal': parsed_data.get('journal'),
             'volume': parsed_data.get('volume'),
             'issue': parsed_data.get('issue'),
             'authors': parsed_data.get('authors', []),
@@ -268,6 +283,7 @@ Return ONLY a valid JSON object with this exact schema, no other text:
             'doi': None,
             'year': None,
             'title': None,
+            'journal': None,
             'volume': None,
             'issue': None,
             'authors': [],
