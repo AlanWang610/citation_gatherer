@@ -12,12 +12,13 @@ from pathlib import Path
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import concurrent.futures
+import requests
 
 dotenv.load_dotenv()
 openai_api_key = os.getenv('OPENAI_API_KEY')
 
-# Initialize Crossref API client
-cr = Crossref(mailto="wangac@mit.edu")
+# Initialize Crossref API client with timeout
+cr = Crossref(mailto="wangac@mit.edu", timeout=30)  # 30 second timeout
 
 # Add type mapping dictionary
 reference_type_map = {
@@ -48,8 +49,8 @@ class RateLimiter:
                 time.sleep(time_to_wait)
             self.last_call = time.time()
 
-# Adjust the rate limiter to be less conservative (50 requests per second instead of 2)
-rate_limiter = RateLimiter(calls_per_second=25)  # Half of the 50 req/s limit to be safe
+# Adjust the rate limiter
+rate_limiter = RateLimiter(calls_per_second=15)
 
 def load_processed_dois():
     """Load already processed DOIs from tracking file"""
@@ -64,19 +65,222 @@ def save_processed_doi(doi):
     with open('processed_dois.txt', 'a') as f:
         f.write(f"{doi}\n")
 
+def search_for_doi(ref_data):
+    """Try to find DOI using available reference fields"""
+    try:
+        # Build core search query with just essential fields
+        query_parts = []
+        
+        # Debug print to see what fields we have
+        print(f"\nFields available in ref_data: {list(ref_data.keys())}")
+        
+        # Add authors if available - handle both string and list formats
+        if 'authors' in ref_data:
+            print(f"Authors data found: {ref_data['authors']}")  # Debug print
+            if isinstance(ref_data['authors'], list):
+                author_names = []
+                for author in ref_data['authors']:
+                    if len(author) >= 2:
+                        author_names.append(f"{author[0]} {author[1]}")
+                if author_names:
+                    query_parts.append(f"author:\"{' '.join(author_names)}\"")
+                else:
+                    print("Warning: Authors list was empty or invalid")  # Debug print
+            else:
+                query_parts.append(f"author:{ref_data['authors']}")
+        else:
+            print("Warning: No authors field found in ref_data")  # Debug print
+        
+        # Add year if available
+        if 'year' in ref_data:
+            query_parts.append(f"year:{ref_data['year']}")
+            
+        # Add title
+        if 'title' in ref_data and ref_data['title']:
+            query_parts.append(f"title:\"{ref_data['title']}\"")
+            
+        if not query_parts:
+            return None
+            
+        # Define fields we need for validation
+        select_fields = [
+            'DOI',
+            'title',
+            'container-title',
+            'volume',
+            'page',
+            'published-print',
+            'author'
+        ]
+            
+        # Perform the search with retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                rate_limiter.wait()
+                query = " ".join(query_parts)
+                print(f"Searching with simplified query: {query}")  # Debug print
+                results = cr.works(
+                    query=query,
+                    limit=3,
+                    select=','.join(select_fields)
+                )
+                break
+            except requests.exceptions.Timeout:
+                if attempt == max_retries - 1:  # Last attempt
+                    print(f"Timeout error after {max_retries} attempts for query: {query}")
+                    return None
+                print(f"Timeout on attempt {attempt + 1}, retrying...")
+                time.sleep(2 * (attempt + 1))  # Exponential backoff
+            except Exception as e:
+                print(f"Error in DOI search attempt {attempt + 1}: {str(e)}")
+                if attempt == max_retries - 1:
+                    return None
+                time.sleep(2 * (attempt + 1))
+        
+        items = results['message']['items']
+        if not items:
+            print(f"No DOI found for query: {query}")
+            return None
+            
+        # Validate results against reference data
+        for item in items:
+            matches = 0
+            total_checks = 0
+            match_details = []
+            
+            # Check authors if available
+            if 'authors' in ref_data and ref_data['authors']:  # Only check if authors exist and non-empty
+                if isinstance(ref_data['authors'], list):
+                    # Handle author list format from LLM parsing
+                    ref_authors = []
+                    for author in ref_data['authors']:
+                        if len(author) >= 2:
+                            first = author[0].lower().strip()
+                            last = author[1].lower().strip()
+                            # Get first initial
+                            first_initial = first[0] if first else ''
+                            ref_authors.append((first_initial, first, last))
+                else:
+                    # Skip author check if string format - not reliable enough
+                    ref_authors = []
+                
+                result_authors = []
+                if 'author' in item:
+                    for author in item['author']:
+                        if 'given' in author and 'family' in author:
+                            given = author.get('given', '').lower().strip()
+                            family = author.get('family', '').lower().strip()
+                            # Get first initial
+                            first_initial = given[0] if given else ''
+                            result_authors.append((first_initial, given, family))
+                
+                if ref_authors and result_authors:  # Only check if both lists have authors
+                    total_checks += 1
+                    # Check if any reference author matches any result author
+                    author_match = any(
+                        (ref_auth[0] == res_auth[0] and ref_auth[2] == res_auth[2])  # Match first initial and last name
+                        or (ref_auth[1] == res_auth[1] and ref_auth[2] == res_auth[2])  # Match full first and last name
+                        for ref_auth in ref_authors
+                        for res_auth in result_authors
+                    )
+                    matches += 1 if author_match else 0
+                    match_details.append(f"Author: {ref_authors} vs {result_authors} -> {'✓' if author_match else '✗'}")
+            
+            # Check year - only if both have valid years
+            if 'year' in ref_data and ref_data['year'] and 'published-print' in item:
+                try:
+                    pub_year = item['published-print']['date-parts'][0][0]
+                    if pub_year:  # Only check if we have a valid year
+                        total_checks += 1
+                        year_match = str(pub_year) == str(ref_data['year'])
+                        matches += 1 if year_match else 0
+                        match_details.append(f"Year: {ref_data['year']} vs {pub_year} -> {'✓' if year_match else '✗'}")
+                except (IndexError, TypeError):
+                    pass  # Skip year check if data is invalid
+            
+            # Check title - only if both have valid titles
+            if 'title' in ref_data and ref_data['title']:
+                ref_title = ref_data['title'].lower()
+                
+                # Get potential titles from both title and container-title fields
+                result_titles = []
+                if 'title' in item and item['title']:
+                    result_titles.append(item['title'][0].lower())
+                if 'container-title' in item and item['container-title']:
+                    result_titles.append(item['container-title'][0].lower())
+                
+                if result_titles:  # Only check if we have titles to compare
+                    total_checks += 1
+                    # Check if reference title matches any of the result titles
+                    title_match = any(ref_title in res_title or res_title in ref_title 
+                                    for res_title in result_titles)
+                    matches += 1 if title_match else 0
+                    match_details.append(f"Title: '{ref_title}' vs {result_titles} -> {'✓' if title_match else '✗'}")
+            
+            # Check volume - only if both have valid volumes
+            if ('volume' in ref_data and ref_data['volume'] and 
+                'volume' in item and item['volume']):
+                total_checks += 1
+                volume_match = str(item['volume']) == str(ref_data['volume'])
+                matches += 1 if volume_match else 0
+                match_details.append(f"Volume: {ref_data['volume']} vs {item['volume']} -> {'✓' if volume_match else '✗'}")
+            
+            # Check first page - only if both have valid pages
+            if ('first-page' in ref_data and ref_data['first-page'] and 
+                'page' in item and item['page']):
+                total_checks += 1
+                page_match = str(item['page']).startswith(str(ref_data['first-page']))
+                matches += 1 if page_match else 0
+                match_details.append(f"First page: {ref_data['first-page']} vs {item['page']} -> {'✓' if page_match else '✗'}")
+            
+            # Print match details regardless of confidence
+            print(f"\nChecking potential match with DOI: {item.get('DOI')}")
+            print("Match details:")
+            for detail in match_details:
+                print(f"  {detail}")
+            print(f"Total confidence: {matches}/{total_checks} = {matches/total_checks:.2%}")
+            
+            # Require both minimum percentage and minimum number of matching fields
+            if total_checks > 0 and matches/total_checks >= 0.6 and matches >= 2:
+                print("✓ Accepting this match")
+                print(f"Query that found match: {query}")
+                return item.get('DOI')
+            else:
+                if matches < 2:
+                    print("✗ Not enough matching fields (minimum 2 required)")
+                else:
+                    print("✗ Confidence too low to accept this match")
+        
+        print(f"\nNo confident matches found for query: {query}")
+        return None
+            
+    except Exception as e:
+        print(f"Error in DOI search: {str(e)}")
+        return None
+
 def fetch_complete_article_data(doi):
     rate_limiter.wait()  # Wait before making API call
     # Add follow parameter to handle redirects
     result = cr.works(ids=doi, follow=True)
     message = result['message']
     
-    # Parse authors with error handling
+    # Parse authors with error handling and affiliations
     authors = []
     if 'author' in message:
         for author in message.get('author', []):
             given = author.get('given', '')
             family = author.get('family', '')
-            authors.append([given, family])
+            affiliation = None
+            # Try to get the first affiliation if available
+            if 'affiliation' in author and author['affiliation']:
+                affiliation = author['affiliation'][0].get('name') if author['affiliation'][0] else None
+            authors.append([given, family, affiliation])
+    
+    # Get abstract safely
+    abstract = None
+    if 'abstract' in message:
+        abstract = message['abstract']
     
     # Get publication date, trying different date fields
     published_date = None
@@ -100,20 +304,44 @@ def fetch_complete_article_data(doi):
         if 'DOI' in ref:
             parsed_ref = fetch_reference_article_data_by_doi(ref['DOI'])
             parsed_references.append(parsed_ref)
-        elif 'journal-title' in ref:
-            ref_data = {k:v for k,v in ref.items() if k != 'key'}
-            ref_data['reference_type'] = 'article'
-            parsed_references.append(ref_data)
-        elif 'article-title' in ref:
-            ref_data = {k:v for k,v in ref.items() if k != 'key'}
-            ref_data['reference_type'] = 'article'
-            parsed_references.append(ref_data)
-        elif 'unstructured' in ref:
-            parsed_ref = fetch_llm_backup(ref['unstructured'], openai_api_key)
-            parsed_references.append(parsed_ref)
         else:
-            skipped_references += 1
-            print(f"Warning: Reference {i+1} could not be parsed - no DOI, journal-title, or unstructured field")
+            # Create clean reference data without excluded fields and normalize field names
+            ref_data = {}
+            for k, v in ref.items():
+                if k not in ['key', 'doi-asserted-by']:
+                    # Normalize field names
+                    if k == 'article-title':
+                        ref_data['title'] = v
+                    elif k == 'journal-title':
+                        ref_data['journal'] = v
+                    else:
+                        ref_data[k] = v
+            
+            # Try to find DOI using available fields
+            found_doi = search_for_doi(ref_data)
+            
+            if found_doi:
+                parsed_ref = fetch_reference_article_data_by_doi(found_doi)
+                parsed_references.append(parsed_ref)
+            elif 'unstructured' in ref:
+                # First try LLM parsing
+                llm_parsed = fetch_llm_backup(ref['unstructured'], openai_api_key)
+                print(llm_parsed)
+                # Try to find DOI using LLM parsed data
+                found_doi_from_llm = search_for_doi(llm_parsed)
+                
+                if found_doi_from_llm:
+                    parsed_ref = fetch_reference_article_data_by_doi(found_doi_from_llm)
+                    parsed_references.append(parsed_ref)
+                else:
+                    # If no DOI found, use the LLM parsed data directly
+                    parsed_references.append(llm_parsed)
+            elif 'title' in ref_data or 'journal' in ref_data:  # Changed condition to use normalized fields
+                ref_data['reference_type'] = 'article'
+                parsed_references.append(ref_data)
+            else:
+                skipped_references += 1
+                print(f"Warning: Reference {i+1} could not be parsed - no DOI found and insufficient fields")
     
     if len(references) != total_ref_count:
         print(f"Warning: Reference count mismatch for DOI {doi}")
@@ -130,9 +358,10 @@ def fetch_complete_article_data(doi):
         'published_date': published_date,
         'title': message.get('title', [None])[0],
         'journal': journal,  # Use safer journal extraction
+        'abstract': abstract,  # Add abstract to the returned data
         'volume': message.get('volume'),
         'issue': message.get('journal-issue', {}).get('issue'),
-        'authors': authors,
+        'authors': authors,  # Now contains [given, family, affiliation]
         'references': parsed_references,
         'reference_stats': {
             'total_references': total_ref_count,
@@ -143,8 +372,7 @@ def fetch_complete_article_data(doi):
 
 def fetch_reference_article_data_by_doi(doi):
     try:
-        rate_limiter.wait()  # Wait before making API call
-        # First try with follow=True
+        rate_limiter.wait()
         result = cr.works(ids=doi, follow=True)
         
         # If we get a redirect response, try to get the new DOI from the Location header
@@ -165,13 +393,17 @@ def fetch_reference_article_data_by_doi(doi):
             else:
                 raise Exception("No redirect URL found in response headers")
         
-        # Parse authors
+        # Parse authors with affiliations
         authors = []
         if 'author' in message:
             for author in message['author']:
                 given = author.get('given', '')
                 family = author.get('family', '')
-                authors.append([given, family])
+                affiliation = None
+                # Try to get the first affiliation if available
+                if 'affiliation' in author and author['affiliation']:
+                    affiliation = author['affiliation'][0].get('name') if author['affiliation'][0] else None
+                authors.append([given, family, affiliation])
 
         # Get published year if available
         year = None
@@ -193,13 +425,11 @@ def fetch_reference_article_data_by_doi(doi):
             'doi': message.get('DOI'),
             'year': year,
             'title': message['title'][0] if message.get('title') else None,
-            'journal': journal,  # Use safer journal extraction
+            'journal': journal,
             'volume': message.get('volume'),
             'issue': issue,
             'authors': authors,
-            'working_paper_institution': None,
-            'book_title': None,
-            'chapter_title': None
+            'working_paper_institution': None
         }
     except Exception as e:
         print(f"Error fetching reference data for DOI {doi}: {str(e)}")
@@ -212,9 +442,7 @@ def fetch_reference_article_data_by_doi(doi):
             'volume': None,
             'issue': None,
             'authors': [],
-            'working_paper_institution': None,
-            'book_title': None,
-            'chapter_title': None
+            'working_paper_institution': None
         }
 
 
@@ -223,13 +451,15 @@ def fetch_llm_backup(text, openai_api_key):
     
     system_instruction = """Please determine if this citation is a journal article, a working paper, or a book. Return this in the reference_type schema field as either ['article', 'working_paper', 'book'].
 
+IMPORTANT: For ALL reference types, you must extract and include the authors field.
+
 If article, parse the authors as a list of lists [['first_1', 'last_1'], ['first_2', 'last_2']], parse the year, parse the title of the article, the name of the journal, the volume, and the issue
 
 If working_paper, parse the authors as a list of lists [['first_1', 'last_1'], ['first_2', 'last_2']], parse the year, the title of the working paper, and the institution
 
-If book, parse parse the authors as a list of lists [['first_1', 'last_1'], ['first_2', 'last_2']], parse the year, the book title, and the chapter title
+If book, parse the authors as a list of lists [['first_1', 'last_1'], ['first_2', 'last_2']], parse the year, and the title
 
-If a given field is missing, it's okay to return nothing in that field. If a field isn't requested for that reference type, don't return it.
+The authors field is REQUIRED for all reference types and should always be a list of [first_name, last_name] pairs.
 
 Return ONLY a valid JSON object with this exact schema, no other text:
 {
@@ -240,10 +470,8 @@ Return ONLY a valid JSON object with this exact schema, no other text:
     "journal": "name of the journal if article",
     "volume": "volume number if article",
     "issue": "issue number if article",
-    "authors": [["first1", "last1"], ["first2", "last2"]],
-    "working_paper_institution": "institution name if working paper",
-    "book_title": "title of the book if book",
-    "chapter_title": "title of the chapter if book"
+    "authors": [["first1", "last1"], ["first2", "last2"]],  # Required for ALL types
+    "working_paper_institution": "institution name if working paper"
 }"""
 
     try:
@@ -263,16 +491,14 @@ Return ONLY a valid JSON object with this exact schema, no other text:
         # Convert the response to match the schema
         result = {
             'reference_type': parsed_data.get('reference_type'),
-            'doi': None,  # Citations typically don't include DOIs
+            'doi': None,
             'year': parsed_data.get('year'),
             'title': parsed_data.get('title'),
             'journal': parsed_data.get('journal'),
             'volume': parsed_data.get('volume'),
             'issue': parsed_data.get('issue'),
             'authors': parsed_data.get('authors', []),
-            'working_paper_institution': parsed_data.get('working_paper_institution'),
-            'book_title': parsed_data.get('book_title'),
-            'chapter_title': parsed_data.get('chapter_title')
+            'working_paper_institution': parsed_data.get('working_paper_institution')
         }
         
         return result
@@ -288,9 +514,7 @@ Return ONLY a valid JSON object with this exact schema, no other text:
             'volume': None,
             'issue': None,
             'authors': [],
-            'working_paper_institution': None,
-            'book_title': None,
-            'chapter_title': None
+            'working_paper_institution': None
         }
 
 def safe_jsonl_append(data, filepath):

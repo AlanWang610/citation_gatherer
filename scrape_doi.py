@@ -8,7 +8,7 @@ import pandas as pd
 cr = Crossref(mailto="wangac@mit.edu")
 
 # Define search parameters
-issn = "0022-3808"  # ISSN for The Review of Financial Studies
+issn = "0022-1082"  # ISSN for The Review of Financial Studies
 start_date = datetime(2000, 1, 1)
 end_date = datetime(2025, 3, 1)
 
@@ -26,10 +26,19 @@ def get_next_quarter(date):
     else:
         return datetime(date.year + 1, 1, 1)
 
-# Query quarter by quarter
-current_date = start_date
-while current_date < end_date:
-    next_date = min(get_next_quarter(current_date), end_date)  # Don't go past end_date
+# Function to get first day of next month
+def get_next_month(date):
+    if date.month == 12:
+        return datetime(date.year + 1, 1, 1)
+    else:
+        return datetime(date.year, date.month + 1, 1)
+
+# Query by specified interval (quarter or month)
+def query_by_interval(current_date, end_date, interval='quarter'):
+    if interval == 'quarter':
+        next_date = min(get_next_quarter(current_date), end_date)
+    else:  # month
+        next_date = min(get_next_month(current_date), end_date)
     
     from_date = current_date.strftime("%Y-%m-%d")
     until_date = next_date.strftime("%Y-%m-%d")
@@ -43,11 +52,11 @@ while current_date < end_date:
                 "from-pub-date": from_date,
                 "until-pub-date": until_date
             },
-            limit=100
+            limit=200
         )
         
         # Extract articles with publication date
-        quarter_articles = [
+        interval_articles = [
             (
                 item["DOI"],
                 item.get("title", [""])[0],
@@ -56,14 +65,20 @@ while current_date < end_date:
             for item in results["message"]["items"]
         ]
         
-        all_articles.extend(quarter_articles)
-        print(f"Found {len(quarter_articles)} articles")
+        all_articles.extend(interval_articles)
+        print(f"Found {len(interval_articles)} articles")
         
     except Exception as e:
         print(f"Error querying {from_date}: {str(e)}")
     
     time.sleep(0.25)  # Delay between requests
-    current_date = next_date
+    return next_date
+
+# Query with specified interval
+interval = 'quarter'  # Change to 'month' for monthly queries
+current_date = start_date
+while current_date < end_date:
+    current_date = query_by_interval(current_date, end_date, interval)
 
 # Remove duplicates while preserving order
 seen = set()
@@ -78,9 +93,9 @@ unique_articles.sort(key=lambda x: x[0])
 
 # Save to CSV
 df = pd.DataFrame(unique_articles, columns=['DOI', 'Title', 'Published Date'])
-df.to_csv('JPE_dois.csv', index=False)
+df.to_csv('JF_dois.csv', index=False)
 
 # Print summary
 print(f"\nCollection complete!")
 print(f"Total unique articles found: {len(unique_articles)}")
-print(f"Results saved to JPE_dois.csv")
+print(f"Results saved to JF_dois.csv")
