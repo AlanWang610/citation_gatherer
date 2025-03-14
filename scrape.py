@@ -17,22 +17,33 @@ import requests
 dotenv.load_dotenv()
 openai_api_key = os.getenv('OPENAI_API_KEY')
 
+# Count cores
+import multiprocessing
+num_cores = multiprocessing.cpu_count()
+
 # Initialize Crossref API client with timeout
 cr = Crossref(mailto="wangac@mit.edu", timeout=30)  # 30 second timeout
 
-# Add type mapping dictionary
+# Define type mapping dictionary
 reference_type_map = {
-    'journal-article': 'article'
+    'journal-article': 'article',
+    'article-journal': 'article',
+    'article': 'article',
+    'journal': 'article',
+    'book': 'book',
+    'monograph': 'book',
+    'book-chapter': 'book',
+    'proceedings-article': 'article',
+    'conference-paper': 'article',
+    'working-paper': 'working_paper',
+    'report': 'working_paper',
+    'dissertation': 'working_paper',
+    'thesis': 'working_paper',
+    'preprint': 'working_paper',
+    None: None
 }
 
-working_paper_terms = {
-    'working paper', 'dissertation', 'research paper',
-    'discussion paper', 'nber paper',
-    'unpublished paper', 'unpublished', 'mimeo',
-    'manuscript', 'work in progress'
-}
-
-# Initialize cache for API calls
+# Add requests cache
 requests_cache.install_cache('crossref_cache', backend='sqlite', expire_after=604800, 
                            allowable_methods=('GET', 'POST'), 
                            allowable_codes=(200, 404, 408, 500),
@@ -43,18 +54,31 @@ class RateLimiter:
         self.delay = 1.0 / calls_per_second
         self.last_call = time.time()
         self.lock = threading.Lock()
+        self.consecutive_429s = 0
+        self.base_delay = self.delay
     
     def wait(self):
         with self.lock:
             current_time = time.time()
-            time_to_wait = self.last_call + self.delay - current_time
+            # Add exponential backoff if we've hit rate limits
+            current_delay = self.base_delay * (2 ** self.consecutive_429s)
+            time_to_wait = self.last_call + current_delay - current_time
             self.last_call = current_time + max(0, time_to_wait)
         
         if time_to_wait > 0:
             time.sleep(time_to_wait)
+    
+    def report_success(self):
+        with self.lock:
+            self.consecutive_429s = max(0, self.consecutive_429s - 1)  # Gradually reduce backoff
+    
+    def report_429(self):
+        with self.lock:
+            self.consecutive_429s += 1
+            print(f"Rate limit hit - increasing delay. Current delay: {self.base_delay * (2 ** self.consecutive_429s):.2f}s")
 
-# Adjust the rate limiter
-rate_limiter = RateLimiter(calls_per_second=15)
+# Adjust the rate limiter to be more conservative
+rate_limiter = RateLimiter(calls_per_second=35)
 
 def load_processed_dois():
     """Load already processed DOIs from tracking file"""
@@ -114,8 +138,8 @@ def search_for_doi(ref_data):
             'author'
         ]
             
-        # Perform the search with retry logic
-        max_retries = 3
+        # Perform the search with retry logic and rate limiting
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 rate_limiter.wait()
@@ -125,7 +149,18 @@ def search_for_doi(ref_data):
                     limit=1,
                     select=','.join(select_fields)
                 )
+                rate_limiter.report_success()  # Report successful call
                 break
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:  # Too Many Requests
+                    rate_limiter.report_429()  # Report rate limit hit
+                    if attempt == max_retries - 1:  # Last attempt
+                        return None
+                    time.sleep(2 * (attempt + 1))  # Additional backoff
+                else:
+                    if attempt == max_retries - 1:
+                        return None
+                    time.sleep(2 * (attempt + 1))
             except requests.exceptions.Timeout:
                 if attempt == max_retries - 1:  # Last attempt
                     return None
@@ -257,148 +292,219 @@ def search_for_doi(ref_data):
         return None
 
 def fetch_complete_article_data(doi):
-    rate_limiter.wait()  # Wait before making API call
-    # Add follow parameter to handle redirects
-    result = cr.works(ids=doi, follow=True)
-    message = result['message']
-    
-    # Parse authors with error handling and affiliations
-    authors = []
-    if 'author' in message:
-        for author in message.get('author', []):
-            given = author.get('given', '')
-            family = author.get('family', '')
-            affiliation = None
-            # Try to get the first affiliation if available
-            if 'affiliation' in author and author['affiliation']:
-                affiliation = author['affiliation'][0].get('name') if author['affiliation'][0] else None
-            authors.append([given, family, affiliation])
-    
-    # Get abstract safely
-    abstract = None
-    if 'abstract' in message:
-        abstract = message['abstract']
-    
-    # Get publication date, trying different date fields
-    published_date = None
-    if 'published-print' in message and 'date-parts' in message['published-print']:
-        date_parts = message['published-print']['date-parts'][0]
-        if len(date_parts) >= 2:
-            published_date = f"{date_parts[0]}-{date_parts[1]:02d}-01"
-    if not published_date and 'published-online' in message and 'date-parts' in message['published-online']:
-        date_parts = message['published-online']['date-parts'][0]
-        if len(date_parts) >= 2:
-            published_date = f"{date_parts[0]}-{date_parts[1]:02d}-01"
-    
-    # Process references with error handling
-    references = message.get('reference', [])
-    total_ref_count = message.get('reference-count', 0)
-    parsed_references = []
-    skipped_references = 0
-    
-    for i, ref in enumerate(references):
-        time.sleep(0.02)
-        if 'DOI' in ref:
-            parsed_ref = fetch_reference_article_data_by_doi(ref['DOI'])
-            parsed_references.append(parsed_ref)
-        else:
-            # First try using unstructured field if available
-            if 'unstructured' in ref:
-                # Try LLM parsing first
-                llm_parsed = fetch_llm_backup(ref['unstructured'], openai_api_key)
-                # Try to find DOI using LLM parsed data
-                found_doi_from_llm = search_for_doi(llm_parsed)
-                
-                if found_doi_from_llm:
-                    parsed_ref = fetch_reference_article_data_by_doi(found_doi_from_llm)
-                    # If this is a working paper and authors have no affiliations, use working paper institution
-                    if (llm_parsed.get('reference_type') == 'working_paper' and 
-                        llm_parsed.get('working_paper_institution')):
-                        for author in parsed_ref['authors']:
-                            if not author[2]:  # if no affiliation
-                                author[2] = llm_parsed['working_paper_institution']
-                    parsed_references.append(parsed_ref)
+    try:
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                rate_limiter.wait()
+                result = cr.works(ids=doi, follow=True)
+                rate_limiter.report_success()
+                break
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:  # Too Many Requests
+                    rate_limiter.report_429()  # Report rate limit hit
+                    if attempt == max_retries - 1:  # Last attempt
+                        raise
+                    time.sleep(2 * (attempt + 1))  # Additional backoff
                 else:
-                    # If no DOI found, use the LLM parsed data directly
-                    # For working papers, set institution as affiliation for all authors
-                    if (llm_parsed.get('reference_type') == 'working_paper' and 
-                        llm_parsed.get('working_paper_institution') and 
-                        llm_parsed.get('authors')):
-                        llm_parsed['authors'] = [
-                            [author[0], author[1], llm_parsed['working_paper_institution']]
-                            for author in llm_parsed['authors']
-                        ]
-                    parsed_references.append(llm_parsed)
+                    if attempt == max_retries - 1:  # Last attempt
+                        raise
+                    time.sleep(2 * (attempt + 1))
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(2 * (attempt + 1))
+
+        # If we get a redirect response, try to get the new DOI from the Location header
+        if isinstance(result, dict) and result.get('status') == 'ok':
+            message = result['message']
+        else:
+            # Get the redirect URL from the Crossref client's last response
+            redirect_url = cr._session.last_response.headers.get('Location')
+            if redirect_url:
+                # Extract new DOI from redirect URL if possible
+                new_doi = redirect_url.split('works/')[-1] if 'works/' in redirect_url else None
+                if new_doi:
+                    rate_limiter.wait()  # Wait before making new API call
+                    result = cr.works(ids=new_doi, follow=True)
+                    rate_limiter.report_success()
+                    message = result['message']
+                else:
+                    raise Exception(f"Could not extract DOI from redirect URL: {redirect_url}")
             else:
-                # If no unstructured field, try with available structured fields
-                ref_data = {}
-                for k, v in ref.items():
-                    if k not in ['key', 'doi-asserted-by']:
-                        # Normalize field names
-                        if k in ['article-title', 'volume-title', 'book-title']:
-                            ref_data['title'] = v
-                        elif k == 'journal-title':
-                            ref_data['journal'] = v
-                        else:
-                            ref_data[k] = v
-                
-                found_doi = search_for_doi(ref_data)
-                
-                if found_doi:
-                    parsed_ref = fetch_reference_article_data_by_doi(found_doi)
-                    # If this is a working paper and authors have no affiliations, use working paper institution
-                    if (ref_data.get('reference_type') == 'working_paper' and 
-                        ref_data.get('working_paper_institution')):
-                        for author in parsed_ref['authors']:
-                            if not author[2]:  # if no affiliation
-                                author[2] = ref_data['working_paper_institution']
+                raise Exception("No redirect URL found in response headers")
+        
+        # Parse authors with error handling and affiliations
+        authors = []
+        if 'author' in message:
+            for author in message.get('author', []):
+                given = author.get('given', '')
+                family = author.get('family', '')
+                affiliation = None
+                # Try to get the first affiliation if available
+                if 'affiliation' in author and author['affiliation']:
+                    affiliation = author['affiliation'][0].get('name') if author['affiliation'][0] else None
+                authors.append([given, family, affiliation])
+        
+        # Get abstract safely
+        abstract = None
+        if 'abstract' in message:
+            abstract = message['abstract']
+        
+        # Get publication date, trying different date fields
+        published_date = None
+        if 'published-print' in message and 'date-parts' in message['published-print']:
+            date_parts = message['published-print']['date-parts'][0]
+            if len(date_parts) >= 2:
+                published_date = f"{date_parts[0]}-{date_parts[1]:02d}-01"
+        if not published_date and 'published-online' in message and 'date-parts' in message['published-online']:
+            date_parts = message['published-online']['date-parts'][0]
+            if len(date_parts) >= 2:
+                published_date = f"{date_parts[0]}-{date_parts[1]:02d}-01"
+        
+        # Process references with error handling
+        references = message.get('reference', [])
+        total_ref_count = message.get('reference-count', 0)
+        parsed_references = []
+        skipped_references = 0
+        
+        for i, ref in enumerate(references):
+            rate_limiter.wait()  # Use rate limiter instead of fixed delay
+            if 'DOI' in ref:
+                parsed_ref = fetch_reference_article_data_by_doi(ref['DOI'])
+                if parsed_ref:  # Only append if we got valid data
                     parsed_references.append(parsed_ref)
-                elif 'title' in ref_data or 'journal' in ref_data:
-                    ref_data['reference_type'] = 'article'
-                    # For working papers, set institution as affiliation for all authors
-                    if (ref_data.get('reference_type') == 'working_paper' and 
-                        ref_data.get('working_paper_institution') and 
-                        ref_data.get('authors')):
-                        ref_data['authors'] = [
-                            [author[0], author[1], ref_data['working_paper_institution']]
-                            for author in ref_data['authors']
-                        ]
-                    parsed_references.append(ref_data)
+                    rate_limiter.report_success()
                 else:
                     skipped_references += 1
-                    print(f"Warning: Reference {i+1} could not be parsed - no DOI found and insufficient fields")
-    
-    if len(references) != total_ref_count:
-        print(f"Warning: Reference count mismatch for DOI {doi}")
-        print(f"Expected {total_ref_count} references but found {len(references)}")
-    
-    # Get journal name safely
-    journal = None
-    if message.get('container-title') and len(message['container-title']) > 0:
-        journal = message['container-title'][0]
-    
-    return {
-        'doi': message.get('DOI'),
-        'type': message.get('type'),
-        'published_date': published_date,
-        'title': message.get('title', [None])[0],
-        'journal': journal,  # Use safer journal extraction
-        'abstract': abstract,  # Add abstract to the returned data
-        'volume': message.get('volume'),
-        'issue': message.get('journal-issue', {}).get('issue'),
-        'authors': authors,  # Now contains [given, family, affiliation]
-        'references': parsed_references,
-        'reference_stats': {
-            'total_references': total_ref_count,
-            'parsed_references': len(parsed_references),
-            'skipped_references': skipped_references
+            else:
+                # First try using unstructured field if available
+                if 'unstructured' in ref:
+                    # Try LLM parsing first
+                    llm_parsed = fetch_llm_backup(ref['unstructured'], openai_api_key)
+                    # Try to find DOI using LLM parsed data
+                    found_doi_from_llm = search_for_doi(llm_parsed)
+                    
+                    if found_doi_from_llm:
+                        parsed_ref = fetch_reference_article_data_by_doi(found_doi_from_llm)
+                        if parsed_ref:  # Only append if we got valid data
+                            # If this is a working paper and authors have no affiliations, use working paper institution
+                            if (llm_parsed.get('reference_type') == 'working_paper' and 
+                                llm_parsed.get('working_paper_institution')):
+                                for author in parsed_ref['authors']:
+                                    if not author[2]:  # if no affiliation
+                                        author[2] = llm_parsed['working_paper_institution']
+                            parsed_references.append(parsed_ref)
+                            rate_limiter.report_success()
+                        else:
+                            skipped_references += 1
+                    else:
+                        # If no DOI found, use the LLM parsed data directly
+                        # For working papers, set institution as affiliation for all authors
+                        if (llm_parsed.get('reference_type') == 'working_paper' and 
+                            llm_parsed.get('working_paper_institution') and 
+                            llm_parsed.get('authors')):
+                            llm_parsed['authors'] = [
+                                [author[0], author[1], llm_parsed['working_paper_institution']]
+                                for author in llm_parsed['authors']
+                            ]
+                        parsed_references.append(llm_parsed)
+                else:
+                    # If no unstructured field, try with available structured fields
+                    ref_data = {}
+                    for k, v in ref.items():
+                        if k not in ['key', 'doi-asserted-by']:
+                            # Normalize field names
+                            if k in ['article-title', 'volume-title', 'book-title']:
+                                ref_data['title'] = v
+                            elif k == 'journal-title':
+                                ref_data['journal'] = v
+                            else:
+                                ref_data[k] = v
+                    
+                    found_doi = search_for_doi(ref_data)
+                    
+                    if found_doi:
+                        parsed_ref = fetch_reference_article_data_by_doi(found_doi)
+                        if parsed_ref:  # Only append if we got valid data
+                            # If this is a working paper and authors have no affiliations, use working paper institution
+                            if (ref_data.get('reference_type') == 'working_paper' and 
+                                ref_data.get('working_paper_institution')):
+                                for author in parsed_ref['authors']:
+                                    if not author[2]:  # if no affiliation
+                                        author[2] = ref_data['working_paper_institution']
+                            parsed_references.append(parsed_ref)
+                            rate_limiter.report_success()
+                        else:
+                            skipped_references += 1
+                    elif 'title' in ref_data or 'journal' in ref_data:
+                        ref_data['reference_type'] = 'article'
+                        # For working papers, set institution as affiliation for all authors
+                        if (ref_data.get('reference_type') == 'working_paper' and 
+                            ref_data.get('working_paper_institution') and 
+                            ref_data.get('authors')):
+                            ref_data['authors'] = [
+                                [author[0], author[1], ref_data['working_paper_institution']]
+                                for author in ref_data['authors']
+                            ]
+                        parsed_references.append(ref_data)
+                    else:
+                        skipped_references += 1
+                        print(f"Warning: Reference {i+1} could not be parsed - no DOI found and insufficient fields")
+        
+        if len(references) != total_ref_count:
+            print(f"Warning: Reference count mismatch for DOI {doi}")
+            print(f"Expected {total_ref_count} references but found {len(references)}")
+        
+        # Get journal name safely
+        journal = None
+        if message.get('container-title') and len(message['container-title']) > 0:
+            journal = message['container-title'][0]
+        
+        return {
+            'doi': message.get('DOI'),
+            'type': message.get('type'),
+            'published_date': published_date,
+            'title': message.get('title', [None])[0],
+            'journal': journal,  # Use safer journal extraction
+            'abstract': abstract,  # Add abstract to the returned data
+            'volume': message.get('volume'),
+            'issue': message.get('journal-issue', {}).get('issue'),
+            'authors': authors,  # Now contains [given, family, affiliation]
+            'references': parsed_references,
+            'reference_stats': {
+                'total_references': total_ref_count,
+                'parsed_references': len(parsed_references),
+                'skipped_references': skipped_references
+            }
         }
-    }
+    except Exception as e:
+        print(f"Error fetching complete article data for DOI {doi}: {str(e)}")
+        return None
 
 def fetch_reference_article_data_by_doi(doi):
     try:
-        rate_limiter.wait()
-        result = cr.works(ids=doi, follow=True)
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                rate_limiter.wait()
+                result = cr.works(ids=doi, follow=True)
+                rate_limiter.report_success()  # Report successful call
+                break
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:  # Too Many Requests
+                    rate_limiter.report_429()  # Report rate limit hit
+                    if attempt == max_retries - 1:  # Last attempt
+                        raise
+                    time.sleep(2 * (attempt + 1))  # Additional backoff
+                else:
+                    if attempt == max_retries - 1:  # Last attempt
+                        raise
+                    time.sleep(2 * (attempt + 1))
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(2 * (attempt + 1))
         
         # If we get a redirect response, try to get the new DOI from the Location header
         if isinstance(result, dict) and result.get('status') == 'ok':
@@ -412,6 +518,7 @@ def fetch_reference_article_data_by_doi(doi):
                 if new_doi:
                     rate_limiter.wait()  # Wait before making new API call
                     result = cr.works(ids=new_doi, follow=True)
+                    rate_limiter.report_success()  # Report successful call
                     message = result['message']
                 else:
                     raise Exception(f"Could not extract DOI from redirect URL: {redirect_url}")
@@ -618,7 +725,7 @@ def process_dois_from_csv(doi_file):
         
         # Process current batch using thread pool
         results_lock = threading.Lock()
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=num_cores) as executor:
             futures = [executor.submit(process_single_doi, args) for args in worker_args]
             
             # Process results as they complete
