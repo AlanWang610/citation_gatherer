@@ -26,8 +26,6 @@ Thumbs.db
 crossref_cache.sqlite
 
 # Output files
-*.json
-*.csv
 *.txt
 *.html
 *.xml
