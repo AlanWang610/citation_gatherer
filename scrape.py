@@ -33,7 +33,10 @@ working_paper_terms = {
 }
 
 # Initialize cache for API calls
-requests_cache.install_cache('crossref_cache', backend='sqlite', expire_after=604800)  # Cache for 1 week
+requests_cache.install_cache('crossref_cache', backend='sqlite', expire_after=604800, 
+                           allowable_methods=('GET', 'POST'), 
+                           allowable_codes=(200, 404, 408, 500),
+                           thread_safe=True)  # Add thread_safe=True
 
 class RateLimiter:
     def __init__(self, calls_per_second):
@@ -45,9 +48,10 @@ class RateLimiter:
         with self.lock:
             current_time = time.time()
             time_to_wait = self.last_call + self.delay - current_time
-            if time_to_wait > 0:
-                time.sleep(time_to_wait)
-            self.last_call = time.time()
+            self.last_call = current_time + max(0, time_to_wait)
+        
+        if time_to_wait > 0:
+            time.sleep(time_to_wait)
 
 # Adjust the rate limiter
 rate_limiter = RateLimiter(calls_per_second=15)
@@ -62,8 +66,11 @@ def load_processed_dois():
 
 def save_processed_doi(doi):
     """Save a DOI to the tracking file"""
-    with open('processed_dois.txt', 'a') as f:
-        f.write(f"{doi}\n")
+    with threading.Lock():  # Add lock
+        with open('processed_dois.txt', 'a', buffering=1) as f:
+            f.write(f"{doi}\n")
+            f.flush()
+            os.fsync(f.fileno())
 
 def search_for_doi(ref_data):
     """Try to find DOI using available reference fields"""
@@ -71,12 +78,8 @@ def search_for_doi(ref_data):
         # Build core search query with just essential fields
         query_parts = []
         
-        # Debug print to see what fields we have
-        print(f"\nFields available in ref_data: {list(ref_data.keys())}")
-        
         # Add authors if available - handle both string and list formats
         if 'authors' in ref_data:
-            print(f"Authors data found: {ref_data['authors']}")  # Debug print
             if isinstance(ref_data['authors'], list):
                 author_names = []
                 for author in ref_data['authors']:
@@ -84,13 +87,11 @@ def search_for_doi(ref_data):
                         author_names.append(f"{author[0]} {author[1]}")
                 if author_names:
                     query_parts.append(f"author:\"{' '.join(author_names)}\"")
-                else:
-                    print("Warning: Authors list was empty or invalid")  # Debug print
             else:
                 query_parts.append(f"author:{ref_data['authors']}")
-        else:
-            print("Warning: No authors field found in ref_data")  # Debug print
-        
+        elif 'author' in ref_data:  # Add this case for single author string
+            query_parts.append(f"author:\"{ref_data['author']}\"")
+            
         # Add year if available
         if 'year' in ref_data:
             query_parts.append(f"year:{ref_data['year']}")
@@ -119,144 +120,140 @@ def search_for_doi(ref_data):
             try:
                 rate_limiter.wait()
                 query = " ".join(query_parts)
-                print(f"Searching with simplified query: {query}")  # Debug print
                 results = cr.works(
                     query=query,
-                    limit=3,
+                    limit=1,
                     select=','.join(select_fields)
                 )
                 break
             except requests.exceptions.Timeout:
                 if attempt == max_retries - 1:  # Last attempt
-                    print(f"Timeout error after {max_retries} attempts for query: {query}")
                     return None
-                print(f"Timeout on attempt {attempt + 1}, retrying...")
                 time.sleep(2 * (attempt + 1))  # Exponential backoff
             except Exception as e:
-                print(f"Error in DOI search attempt {attempt + 1}: {str(e)}")
                 if attempt == max_retries - 1:
                     return None
                 time.sleep(2 * (attempt + 1))
         
         items = results['message']['items']
         if not items:
-            print(f"No DOI found for query: {query}")
             return None
             
-        # Validate results against reference data
-        for item in items:
-            matches = 0
-            total_checks = 0
-            match_details = []
-            
-            # Check authors if available
-            if 'authors' in ref_data and ref_data['authors']:  # Only check if authors exist and non-empty
-                if isinstance(ref_data['authors'], list):
-                    # Handle author list format from LLM parsing
-                    ref_authors = []
-                    for author in ref_data['authors']:
-                        if len(author) >= 2:
-                            first = author[0].lower().strip()
-                            last = author[1].lower().strip()
-                            # Get first initial
-                            first_initial = first[0] if first else ''
-                            ref_authors.append((first_initial, first, last))
-                else:
-                    # Skip author check if string format - not reliable enough
-                    ref_authors = []
-                
-                result_authors = []
-                if 'author' in item:
-                    for author in item['author']:
-                        if 'given' in author and 'family' in author:
-                            given = author.get('given', '').lower().strip()
-                            family = author.get('family', '').lower().strip()
-                            # Get first initial
-                            first_initial = given[0] if given else ''
-                            result_authors.append((first_initial, given, family))
-                
-                if ref_authors and result_authors:  # Only check if both lists have authors
-                    total_checks += 1
-                    # Check if any reference author matches any result author
-                    author_match = any(
-                        (ref_auth[0] == res_auth[0] and ref_auth[2] == res_auth[2])  # Match first initial and last name
-                        or (ref_auth[1] == res_auth[1] and ref_auth[2] == res_auth[2])  # Match full first and last name
-                        for ref_auth in ref_authors
-                        for res_auth in result_authors
-                    )
-                    matches += 1 if author_match else 0
-                    match_details.append(f"Author: {ref_authors} vs {result_authors} -> {'✓' if author_match else '✗'}")
-            
-            # Check year - only if both have valid years
-            if 'year' in ref_data and ref_data['year'] and 'published-print' in item:
-                try:
-                    pub_year = item['published-print']['date-parts'][0][0]
-                    if pub_year:  # Only check if we have a valid year
-                        total_checks += 1
-                        year_match = str(pub_year) == str(ref_data['year'])
-                        matches += 1 if year_match else 0
-                        match_details.append(f"Year: {ref_data['year']} vs {pub_year} -> {'✓' if year_match else '✗'}")
-                except (IndexError, TypeError):
-                    pass  # Skip year check if data is invalid
-            
-            # Check title - only if both have valid titles
-            if 'title' in ref_data and ref_data['title']:
-                ref_title = ref_data['title'].lower()
-                
-                # Get potential titles from both title and container-title fields
-                result_titles = []
-                if 'title' in item and item['title']:
-                    result_titles.append(item['title'][0].lower())
-                if 'container-title' in item and item['container-title']:
-                    result_titles.append(item['container-title'][0].lower())
-                
-                if result_titles:  # Only check if we have titles to compare
-                    total_checks += 1
-                    # Check if reference title matches any of the result titles
-                    title_match = any(ref_title in res_title or res_title in ref_title 
-                                    for res_title in result_titles)
-                    matches += 1 if title_match else 0
-                    match_details.append(f"Title: '{ref_title}' vs {result_titles} -> {'✓' if title_match else '✗'}")
-            
-            # Check volume - only if both have valid volumes
-            if ('volume' in ref_data and ref_data['volume'] and 
-                'volume' in item and item['volume']):
-                total_checks += 1
-                volume_match = str(item['volume']) == str(ref_data['volume'])
-                matches += 1 if volume_match else 0
-                match_details.append(f"Volume: {ref_data['volume']} vs {item['volume']} -> {'✓' if volume_match else '✗'}")
-            
-            # Check first page - only if both have valid pages
-            if ('first-page' in ref_data and ref_data['first-page'] and 
-                'page' in item and item['page']):
-                total_checks += 1
-                page_match = str(item['page']).startswith(str(ref_data['first-page']))
-                matches += 1 if page_match else 0
-                match_details.append(f"First page: {ref_data['first-page']} vs {item['page']} -> {'✓' if page_match else '✗'}")
-            
-            # Print match details regardless of confidence
-            print(f"\nChecking potential match with DOI: {item.get('DOI')}")
-            print("Match details:")
-            for detail in match_details:
-                print(f"  {detail}")
-            print(f"Total confidence: {matches}/{total_checks} = {matches/total_checks:.2%}")
-            
-            # Require both minimum percentage and minimum number of matching fields
-            if total_checks > 0 and matches/total_checks >= 0.6 and matches >= 2:
-                print("✓ Accepting this match")
-                print(f"Query that found match: {query}")
-                return item.get('DOI')
-            else:
-                if matches < 2:
-                    print("✗ Not enough matching fields (minimum 2 required)")
-                else:
-                    print("✗ Confidence too low to accept this match")
+        # Validate just the first result
+        item = items[0]
+        matches = 0
+        total_checks = 0
+        match_details = []
         
-        print(f"\nNo confident matches found for query: {query}")
+        # Check authors if available
+        if 'authors' in ref_data and ref_data['authors']:
+            if isinstance(ref_data['authors'], list):
+                ref_authors = []
+                for author in ref_data['authors']:
+                    if len(author) >= 2:
+                        first = author[0].lower().strip()
+                        last = author[1].lower().strip()
+                        first_initial = first[0] if first else ''
+                        ref_authors.append((first_initial, first, last))
+            else:
+                ref_authors = []
+        elif 'author' in ref_data and ref_data['author']:
+            author_str = ref_data['author'].lower().strip()
+            ref_authors = [(author_str[0], author_str, author_str)]
+        else:
+            ref_authors = []
+        
+        result_authors = []
+        if 'author' in item:
+            for author in item['author']:
+                if 'given' in author and 'family' in author:
+                    given = author.get('given', '').lower().strip()
+                    family = author.get('family', '').lower().strip()
+                    first_initial = given[0] if given else ''
+                    result_authors.append((first_initial, given, family))
+        
+        if ref_authors and result_authors:
+            total_checks += 1
+            author_match = any(
+                (ref_auth[0] == res_auth[0] and ref_auth[2] in res_auth[2] or res_auth[2] in ref_auth[2])
+                or (ref_auth[1] in res_auth[1] or res_auth[1] in ref_auth[1])
+                or any(name in res_auth[2] or res_auth[2] in name
+                      for name in [ref_auth[1], ref_auth[2]])
+                for ref_auth in ref_authors
+                for res_auth in result_authors
+            )
+            matches += 1 if author_match else 0
+            match_details.append(f"Author: {ref_authors} vs {result_authors} -> {'✓' if author_match else '✗'}")
+        
+        # Check year - only if both have valid years
+        if 'year' in ref_data and ref_data['year'] and 'published-print' in item:
+            try:
+                pub_year = item['published-print']['date-parts'][0][0]
+                if pub_year:  # Only check if we have a valid year
+                    total_checks += 1
+                    year_match = str(pub_year) == str(ref_data['year'])
+                    matches += 1 if year_match else 0
+                    match_details.append(f"Year: {ref_data['year']} vs {pub_year} -> {'✓' if year_match else '✗'}")
+            except (IndexError, TypeError):
+                pass  # Skip year check if data is invalid
+        
+        # Check title - only if both have valid titles
+        if 'title' in ref_data and ref_data['title']:
+            ref_title = ref_data['title'].lower()
+            
+            # Get potential titles from both title and container-title fields
+            result_titles = []
+            if 'title' in item and item['title']:
+                result_titles.append(item['title'][0].lower())
+            if 'container-title' in item and item['container-title']:
+                result_titles.append(item['container-title'][0].lower())
+            
+            if result_titles:  # Only check if we have titles to compare
+                total_checks += 1
+                
+                # Split titles into words and remove common stop words
+                stop_words = {'a', 'an', 'and', 'the', 'in', 'on', 'at', 'to', 'for', 'of'}
+                ref_words = {word for word in ref_title.split() if word not in stop_words}
+                
+                # Check word overlap with each result title
+                title_match = any(
+                    len(ref_words & {word for word in res_title.split() if word not in stop_words}) >= 3  # Match if 3+ words overlap
+                    or ref_title in res_title 
+                    or res_title in ref_title
+                    for res_title in result_titles
+                )
+                
+                matches += 1 if title_match else 0
+                match_details.append(f"Title: '{ref_title}' vs {result_titles} -> {'✓' if title_match else '✗'}")
+        
+        # Check volume - only if both have valid volumes
+        if ('volume' in ref_data and ref_data['volume'] and 
+            'volume' in item and item['volume']):
+            total_checks += 1
+            volume_match = str(item['volume']) == str(ref_data['volume'])
+            matches += 1 if volume_match else 0
+            match_details.append(f"Volume: {ref_data['volume']} vs {item['volume']} -> {'✓' if volume_match else '✗'}")
+        
+        # Check first page - only if both have valid pages
+        if ('first-page' in ref_data and ref_data['first-page'] and 
+            'page' in item and item['page']):
+            total_checks += 1
+            page_match = str(item['page']).startswith(str(ref_data['first-page']))
+            matches += 1 if page_match else 0
+            match_details.append(f"First page: {ref_data['first-page']} vs {item['page']} -> {'✓' if page_match else '✗'}")
+        
+        # Check if we have at least one author or title match
+        author_matched = any(detail.startswith("Author") and detail.endswith("✓") for detail in match_details)
+        title_matched = any(detail.startswith("Title") and detail.endswith("✓") for detail in match_details)
+        
+        # Require both minimum percentage and minimum number of matching fields, plus at least one critical field
+        if (total_checks > 0 and matches/total_checks >= 0.6 and matches >= 2 
+            and (author_matched or title_matched)):
+            return item.get('DOI')
+            
         return None
             
     except Exception as e:
-        print(f"Error in DOI search: {str(e)}")
         return None
 
 def fetch_complete_article_data(doi):
@@ -305,43 +302,71 @@ def fetch_complete_article_data(doi):
             parsed_ref = fetch_reference_article_data_by_doi(ref['DOI'])
             parsed_references.append(parsed_ref)
         else:
-            # Create clean reference data without excluded fields and normalize field names
-            ref_data = {}
-            for k, v in ref.items():
-                if k not in ['key', 'doi-asserted-by']:
-                    # Normalize field names
-                    if k == 'article-title':
-                        ref_data['title'] = v
-                    elif k == 'journal-title':
-                        ref_data['journal'] = v
-                    else:
-                        ref_data[k] = v
-            
-            # Try to find DOI using available fields
-            found_doi = search_for_doi(ref_data)
-            
-            if found_doi:
-                parsed_ref = fetch_reference_article_data_by_doi(found_doi)
-                parsed_references.append(parsed_ref)
-            elif 'unstructured' in ref:
-                # First try LLM parsing
+            # First try using unstructured field if available
+            if 'unstructured' in ref:
+                # Try LLM parsing first
                 llm_parsed = fetch_llm_backup(ref['unstructured'], openai_api_key)
-                print(llm_parsed)
                 # Try to find DOI using LLM parsed data
                 found_doi_from_llm = search_for_doi(llm_parsed)
                 
                 if found_doi_from_llm:
                     parsed_ref = fetch_reference_article_data_by_doi(found_doi_from_llm)
+                    # If this is a working paper and authors have no affiliations, use working paper institution
+                    if (llm_parsed.get('reference_type') == 'working_paper' and 
+                        llm_parsed.get('working_paper_institution')):
+                        for author in parsed_ref['authors']:
+                            if not author[2]:  # if no affiliation
+                                author[2] = llm_parsed['working_paper_institution']
                     parsed_references.append(parsed_ref)
                 else:
                     # If no DOI found, use the LLM parsed data directly
+                    # For working papers, set institution as affiliation for all authors
+                    if (llm_parsed.get('reference_type') == 'working_paper' and 
+                        llm_parsed.get('working_paper_institution') and 
+                        llm_parsed.get('authors')):
+                        llm_parsed['authors'] = [
+                            [author[0], author[1], llm_parsed['working_paper_institution']]
+                            for author in llm_parsed['authors']
+                        ]
                     parsed_references.append(llm_parsed)
-            elif 'title' in ref_data or 'journal' in ref_data:  # Changed condition to use normalized fields
-                ref_data['reference_type'] = 'article'
-                parsed_references.append(ref_data)
             else:
-                skipped_references += 1
-                print(f"Warning: Reference {i+1} could not be parsed - no DOI found and insufficient fields")
+                # If no unstructured field, try with available structured fields
+                ref_data = {}
+                for k, v in ref.items():
+                    if k not in ['key', 'doi-asserted-by']:
+                        # Normalize field names
+                        if k in ['article-title', 'volume-title', 'book-title']:
+                            ref_data['title'] = v
+                        elif k == 'journal-title':
+                            ref_data['journal'] = v
+                        else:
+                            ref_data[k] = v
+                
+                found_doi = search_for_doi(ref_data)
+                
+                if found_doi:
+                    parsed_ref = fetch_reference_article_data_by_doi(found_doi)
+                    # If this is a working paper and authors have no affiliations, use working paper institution
+                    if (ref_data.get('reference_type') == 'working_paper' and 
+                        ref_data.get('working_paper_institution')):
+                        for author in parsed_ref['authors']:
+                            if not author[2]:  # if no affiliation
+                                author[2] = ref_data['working_paper_institution']
+                    parsed_references.append(parsed_ref)
+                elif 'title' in ref_data or 'journal' in ref_data:
+                    ref_data['reference_type'] = 'article'
+                    # For working papers, set institution as affiliation for all authors
+                    if (ref_data.get('reference_type') == 'working_paper' and 
+                        ref_data.get('working_paper_institution') and 
+                        ref_data.get('authors')):
+                        ref_data['authors'] = [
+                            [author[0], author[1], ref_data['working_paper_institution']]
+                            for author in ref_data['authors']
+                        ]
+                    parsed_references.append(ref_data)
+                else:
+                    skipped_references += 1
+                    print(f"Warning: Reference {i+1} could not be parsed - no DOI found and insufficient fields")
     
     if len(references) != total_ref_count:
         print(f"Warning: Reference count mismatch for DOI {doi}")
@@ -607,10 +632,7 @@ def process_dois_from_csv(doi_file):
                                 safe_jsonl_append(article_data, output_file)
                                 
                                 # Mark DOI as processed
-                                with open('processed_dois.txt', 'a', buffering=1) as f:
-                                    f.write(f"{doi}\n")
-                                    f.flush()
-                                    os.fsync(f.fileno())
+                                save_processed_doi(doi)
                                 
                                 print(f"Successfully processed and saved DOI: {doi}")
                             except Exception as e:

@@ -3,6 +3,8 @@ archive/
 data/
 downloaded_html/
 outputs/
+stats/
+visualization/
 
 # Python virtual environment
 .venv/
@@ -19,6 +21,9 @@ Thumbs.db
 
 # Environment variables
 .env
+
+# Cache files
+crossref_cache.sqlite
 
 # Output files
 *.json
