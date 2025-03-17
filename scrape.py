@@ -665,7 +665,7 @@ def safe_jsonl_append(data, filepath):
         print(f"Error appending to JSONL: {str(e)}")
         raise e
 
-def initialize_files():
+def initialize_files(journal):
     """Initialize necessary files if they don't exist"""
     # Initialize processed_dois.txt
     processed_file = Path('processed_dois.txt')
@@ -673,11 +673,11 @@ def initialize_files():
         processed_file.touch()
         print("Created processed_dois.txt")
 
-    # Initialize articles_data.jsonl instead of .json
-    output_file = Path('articles_data.jsonl')
+    # Initialize {journal}_articles.jsonl
+    output_file = Path(f'{journal}_articles.jsonl')
     if not output_file.exists():
         output_file.touch()
-        print("Created articles_data.jsonl")
+        print(f"Created {journal}_articles.jsonl")
 
 def process_single_doi(args):
     doi, total_dois, current_position = args
@@ -690,8 +690,11 @@ def process_single_doi(args):
         return doi, None, str(e)  # Return the error message
 
 def process_dois_from_csv(doi_file):
-    # Initialize files
-    initialize_files()
+    # Get journal name from input filename
+    journal = Path(doi_file).stem.replace('_dois', '')
+    
+    # Initialize files with journal name
+    initialize_files(journal)
     
     # Read DOIs from CSV
     df = pd.read_csv(doi_file)
@@ -716,7 +719,7 @@ def process_dois_from_csv(doi_file):
         current_batch = dois_to_process[batch_start:batch_end]
         
         # Load only the most recent batch of data
-        output_file = Path('articles_data.jsonl')
+        output_file = Path(f'{journal}_articles.jsonl')
         articles_data = []  # Start fresh for each batch
         
         # Prepare arguments for worker function

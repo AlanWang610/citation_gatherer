@@ -3,12 +3,17 @@ import time
 from datetime import datetime, timedelta
 import csv
 import pandas as pd
+import sys
+
+# Get the ISSN and the filename from the command line
+issn = sys.argv[1]
+filename = sys.argv[2]
 
 # Initialize Crossref API client
 cr = Crossref(mailto="wangac@mit.edu")
 
+
 # Define search parameters
-issn = "0022-1082"  # ISSN for The Review of Financial Studies
 start_date = datetime(2000, 1, 1)
 end_date = datetime(2025, 3, 1)
 
@@ -93,9 +98,9 @@ unique_articles.sort(key=lambda x: x[0])
 
 # Save to CSV
 df = pd.DataFrame(unique_articles, columns=['DOI', 'Title', 'Published Date'])
-df.to_csv('JF_dois.csv', index=False)
+df.to_csv(f'{filename}', index=False)
 
 # Print summary
 print(f"\nCollection complete!")
 print(f"Total unique articles found: {len(unique_articles)}")
-print(f"Results saved to JF_dois.csv")
+print(f"Results saved to {filename}")
