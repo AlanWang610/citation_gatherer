@@ -19,7 +19,7 @@ openai_api_key = os.getenv('OPENAI_API_KEY')
 
 # Count cores
 import multiprocessing
-num_cores = multiprocessing.cpu_count()
+num_cores = 1
 
 # Initialize Crossref API client with timeout
 cr = Crossref(mailto="wangac@mit.edu", timeout=30)  # 30 second timeout
