@@ -28,3 +28,8 @@ crossref_cache.sqlite
 # Output files
 *.html
 *.xml
+
+# Output folders
+scraped_articles/
+DOI_lists/
+archive/

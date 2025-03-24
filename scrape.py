@@ -369,10 +369,10 @@ def fetch_complete_article_data(doi):
         skipped_references = 0
         
         for i, ref in enumerate(references):
-            rate_limiter.wait()  # Use rate limiter instead of fixed delay
+            rate_limiter.wait()
             if 'DOI' in ref:
                 parsed_ref = fetch_reference_article_data_by_doi(ref['DOI'])
-                if parsed_ref:  # Only append if we got valid data
+                if parsed_ref:
                     parsed_references.append(parsed_ref)
                     rate_limiter.report_success()
                 else:
@@ -381,34 +381,22 @@ def fetch_complete_article_data(doi):
                 # First try using unstructured field if available
                 if 'unstructured' in ref:
                     # Try LLM parsing first
-                    llm_parsed = fetch_llm_backup(ref['unstructured'], openai_api_key)
-                    # Try to find DOI using LLM parsed data
-                    found_doi_from_llm = search_for_doi(llm_parsed)
+                    llm_parsed, llm_error = fetch_llm_backup(ref['unstructured'], openai_api_key)
+                    if llm_error:
+                        # Attach error to the result object
+                        result = {'llm_parsing_error': llm_error}
+                        return result
                     
-                    if found_doi_from_llm:
-                        parsed_ref = fetch_reference_article_data_by_doi(found_doi_from_llm)
-                        if parsed_ref:  # Only append if we got valid data
-                            # If this is a working paper and authors have no affiliations, use working paper institution
-                            if (llm_parsed.get('reference_type') == 'working_paper' and 
-                                llm_parsed.get('working_paper_institution')):
-                                for author in parsed_ref['authors']:
-                                    if not author[2]:  # if no affiliation
-                                        author[2] = llm_parsed['working_paper_institution']
-                            parsed_references.append(parsed_ref)
-                            rate_limiter.report_success()
-                        else:
-                            skipped_references += 1
-                    else:
-                        # If no DOI found, use the LLM parsed data directly
-                        # For working papers, set institution as affiliation for all authors
+                    # Continue with existing logic if no error
+                    if llm_parsed:
+                        # If this is a working paper and authors have no affiliations, use working paper institution
                         if (llm_parsed.get('reference_type') == 'working_paper' and 
-                            llm_parsed.get('working_paper_institution') and 
-                            llm_parsed.get('authors')):
-                            llm_parsed['authors'] = [
-                                [author[0], author[1], llm_parsed['working_paper_institution']]
-                                for author in llm_parsed['authors']
-                            ]
-                        parsed_references.append(llm_parsed)
+                            llm_parsed.get('working_paper_institution')):
+                            for author in parsed_ref['authors']:
+                                if not author[2]:  # if no affiliation
+                                    author[2] = llm_parsed['working_paper_institution']
+                        parsed_references.append(parsed_ref)
+                        rate_limiter.report_success()
                 else:
                     # If no unstructured field, try with available structured fields
                     ref_data = {}
@@ -633,21 +621,12 @@ Return ONLY a valid JSON object with this exact schema, no other text:
             'working_paper_institution': parsed_data.get('working_paper_institution')
         }
         
-        return result
+        return result, None  # Return result and no error
         
     except Exception as e:
-        print(f"Error in LLM parsing: {str(e)}")
-        return {
-            'reference_type': None,
-            'doi': None,
-            'year': None,
-            'title': None,
-            'journal': None,
-            'volume': None,
-            'issue': None,
-            'authors': [],
-            'working_paper_institution': None
-        }
+        error_msg = f"Error in LLM parsing: {str(e)}"
+        print(error_msg)
+        return None, error_msg  # Return no result and error message
 
 def safe_jsonl_append(data, filepath):
     """Safely append a single JSON object as a new line"""
@@ -684,10 +663,18 @@ def process_single_doi(args):
     try:
         print(f"Processing DOI ({current_position}/{total_dois}): {doi}")
         article_data = fetch_complete_article_data(doi)
-        return doi, article_data, None  # None means no error
+        
+        # Check if there were any LLM parsing errors during the process
+        if hasattr(article_data, 'llm_parsing_error'):
+            error_msg = f"Skipping DOI {doi} due to LLM parsing error: {article_data.llm_parsing_error}"
+            print(error_msg)
+            return doi, None, error_msg
+            
+        return doi, article_data, None
     except Exception as e:
-        print(f"Error processing DOI {doi}: {str(e)}")
-        return doi, None, str(e)  # Return the error message
+        error_msg = f"Error processing DOI {doi}: {str(e)}"
+        print(error_msg)
+        return doi, None, error_msg
 
 def process_dois_from_csv(doi_file):
     # Get journal name from input filename

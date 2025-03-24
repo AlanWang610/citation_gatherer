@@ -98,7 +98,7 @@ unique_articles.sort(key=lambda x: x[0])
 
 # Save to CSV
 df = pd.DataFrame(unique_articles, columns=['DOI', 'Title', 'Published Date'])
-df.to_csv(f'{filename}', index=False)
+df.to_csv(f'DOI_lists/{filename}', index=False)
 
 # Print summary
 print(f"\nCollection complete!")

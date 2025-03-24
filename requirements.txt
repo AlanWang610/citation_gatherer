@@ -1,7 +1,7 @@
-beautifulsoup4
-pandas
-python-dotenv
-openai
 habanero
+datetime
+pandas
+dotenv
+openai
 requests_cache
 requests
