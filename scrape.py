@@ -81,12 +81,16 @@ class RateLimiter:
 rate_limiter = RateLimiter(calls_per_second=35)
 
 def load_processed_dois():
-    """Load already processed DOIs from tracking file"""
+    """Load already processed DOIs from tracking file and output JSONL file"""
+    processed_dois = set()
+    
+    # Check processed_dois.txt
     processed_file = Path('processed_dois.txt')
     if processed_file.exists():
         with open(processed_file, 'r') as f:
-            return set(line.strip() for line in f)
-    return set()
+            processed_dois.update(line.strip() for line in f)
+    
+    return processed_dois
 
 def save_processed_doi(doi):
     """Save a DOI to the tracking file"""
@@ -676,6 +680,23 @@ def process_single_doi(args):
         print(error_msg)
         return doi, None, error_msg
 
+def load_dois_from_jsonl(journal):
+    """Load DOIs from existing output JSONL file"""
+    output_file = Path(f'{journal}_articles.jsonl')
+    dois_in_jsonl = set()
+    
+    if output_file.exists():
+        with open(output_file, 'r') as f:
+            for line in f:
+                try:
+                    article = json.loads(line)
+                    if 'doi' in article and article['doi']:
+                        dois_in_jsonl.add(article['doi'])
+                except json.JSONDecodeError:
+                    continue
+    
+    return dois_in_jsonl
+
 def process_dois_from_csv(doi_file):
     # Get journal name from input filename
     journal = Path(doi_file).stem.replace('_dois', '')
@@ -688,15 +709,21 @@ def process_dois_from_csv(doi_file):
     dois = df['DOI'].tolist()
     del df  # Clear DataFrame from memory
     
-    # Load already processed DOIs
+    # Load already processed DOIs from both sources
     processed_dois = load_processed_dois()
+    dois_in_jsonl = load_dois_from_jsonl(journal)
+    
+    # Combine both sets of processed DOIs
+    all_processed_dois = processed_dois.union(dois_in_jsonl)
     
     # Filter out already processed DOIs
-    dois_to_process = [doi for doi in dois if doi not in processed_dois]
+    dois_to_process = [doi for doi in dois if doi not in all_processed_dois]
     total_to_process = len(dois_to_process)
     
     print(f"Found {len(dois)} total DOIs")
-    print(f"Already processed {len(processed_dois)} DOIs")
+    print(f"Already processed {len(processed_dois)} DOIs from tracking file")
+    print(f"Found {len(dois_in_jsonl)} DOIs in existing output file")
+    print(f"Total unique processed DOIs: {len(all_processed_dois)}")
     print(f"Remaining DOIs to process: {total_to_process}")
     
     # Process DOIs in batches of 50

@@ -53,3 +53,8 @@ is the field more integrated in how knowledge disperses?
 PhD location
 employed at time of publication
 prefer JEL codes over SciBERT
+
+Done:
+JFE
+QJE
+RFS (rerun)
