@@ -357,14 +357,33 @@ def fetch_complete_article_data(doi):
         
         # Get publication date, trying different date fields
         published_date = None
+        
+        # Try to get the full date from published-print first
         if 'published-print' in message and 'date-parts' in message['published-print']:
             date_parts = message['published-print']['date-parts'][0]
             if len(date_parts) >= 2:
                 published_date = f"{date_parts[0]}-{date_parts[1]:02d}-01"
+            elif len(date_parts) >= 1:
+                # If we only have the year, just use that
+                published_date = str(date_parts[0])
+        
+        # If no date yet, try published-online
         if not published_date and 'published-online' in message and 'date-parts' in message['published-online']:
             date_parts = message['published-online']['date-parts'][0]
             if len(date_parts) >= 2:
                 published_date = f"{date_parts[0]}-{date_parts[1]:02d}-01"
+            elif len(date_parts) >= 1:
+                # If we only have the year, just use that
+                published_date = str(date_parts[0])
+        
+        # If still no date, try created as last resort
+        if not published_date and 'created' in message and 'date-parts' in message['created']:
+            date_parts = message['created']['date-parts'][0]
+            if len(date_parts) >= 2:
+                published_date = f"{date_parts[0]}-{date_parts[1]:02d}-01"
+            elif len(date_parts) >= 1:
+                # If we only have the year, just use that
+                published_date = str(date_parts[0])
         
         # Process references with error handling
         references = message.get('reference', [])
@@ -458,11 +477,11 @@ def fetch_complete_article_data(doi):
             'type': message.get('type'),
             'published_date': published_date,
             'title': message.get('title', [None])[0],
-            'journal': journal,  # Use safer journal extraction
-            'abstract': abstract,  # Add abstract to the returned data
+            'journal': journal,
+            'abstract': abstract,
             'volume': message.get('volume'),
             'issue': message.get('journal-issue', {}).get('issue'),
-            'authors': authors,  # Now contains [given, family, affiliation]
+            'authors': authors,
             'references': parsed_references,
             'reference_stats': {
                 'total_references': total_ref_count,
@@ -533,6 +552,12 @@ def fetch_reference_article_data_by_doi(doi):
         year = None
         if 'published-print' in message and 'date-parts' in message['published-print']:
             year = message['published-print']['date-parts'][0][0]
+        # If no year yet, try published-online
+        if not year and 'published-online' in message and 'date-parts' in message['published-online']:
+            year = message['published-online']['date-parts'][0][0]
+        # If still no year, try created as last resort
+        if not year and 'created' in message and 'date-parts' in message['created']:
+            year = message['created']['date-parts'][0][0]
 
         # Get issue if available
         issue = None

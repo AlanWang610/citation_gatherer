@@ -50,31 +50,48 @@ def query_by_interval(current_date, end_date, interval='quarter'):
     
     print(f"\nQuerying period: {from_date} to {until_date}")
     
-    try:
-        results = cr.works(
-            filter={
-                "issn": issn,
-                "from-pub-date": from_date,
-                "until-pub-date": until_date
-            },
-            limit=200
-        )
-        
-        # Extract articles with publication date
-        interval_articles = [
-            (
-                item["DOI"],
-                item.get("title", [""])[0],
-                item.get("published-print", {}).get("date-parts", [[""]])[0][0]
+    max_retries = 3
+    retry_count = 0
+    retry_delay = 30  # seconds
+    
+    while retry_count < max_retries:
+        try:
+            results = cr.works(
+                filter={
+                    "issn": issn,
+                    "from-pub-date": from_date,
+                    "until-pub-date": until_date
+                },
+                limit=200
             )
-            for item in results["message"]["items"]
-        ]
-        
-        all_articles.extend(interval_articles)
-        print(f"Found {len(interval_articles)} articles")
-        
-    except Exception as e:
-        print(f"Error querying {from_date}: {str(e)}")
+            
+            # Extract articles with publication date
+            interval_articles = [
+                (
+                    item["DOI"],
+                    item.get("title", [""])[0],
+                    item.get("published-print", {}).get("date-parts", [[""]])[0][0]
+                )
+                for item in results["message"]["items"]
+            ]
+            
+            all_articles.extend(interval_articles)
+            print(f"Found {len(interval_articles)} articles")
+            
+            # If successful, break out of retry loop
+            break
+            
+        except Exception as e:
+            retry_count += 1
+            if retry_count < max_retries:
+                print(f"Error querying {from_date}: {str(e)}")
+                print(f"Retrying in {retry_delay} seconds... (Attempt {retry_count+1}/{max_retries})")
+                time.sleep(retry_delay)
+                # Increase delay for next retry
+                retry_delay *= 2
+            else:
+                print(f"Failed after {max_retries} attempts for period {from_date} to {until_date}: {str(e)}")
+                print("Moving to next interval...")
     
     time.sleep(0.25)  # Delay between requests
     return next_date
